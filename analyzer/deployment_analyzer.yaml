@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: py-tss-analyzer-linux
+  labels:
+    app: py-tss-analyzer-linux
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: py-tss-analyzer-linux
+  template:
+    metadata:
+      labels:
+        app: py-tss-analyzer-linux
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+      containers:
+      - name: py-tss-analyzer-linux
+        image: azzulhisham/py-tss-analyzer-linux:v1.20
+        ports:
+        - containerPort: 8080
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        # resources:
+        #   requests:
+        #     memory: "500Mi"     # Minimum memory requested
+        #     cpu: "500m"       # Minimum CPU requested
+        #   limits:
+        #     memory: "1Gi"     # Maximum memory allowed
+        #     cpu: "1000m"      # Maximum CPU allowed
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: py-tss-analyzer-linux-service
+  labels:
+    app: py-tss-analyzer-linux
+spec:
+  selector:
+    app: py-tss-analyzer-linux
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: NodePort

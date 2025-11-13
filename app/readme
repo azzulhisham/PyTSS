@@ -1,0 +1,18 @@
+# Install all requirement libraries using pip
+pip install -r requirement.txt
+
+
+# -----  Streamlit Application  -----
+# run the streamlit application using the following command
+streamlit run app.py --server.port 8080
+
+# to build docker image
+docker build --platform linux/amd64 -t azzulhisham/py-strm-tss-linux:v1.03 -f Dockerfile_streamlit .  
+
+# push image to docker hub
+docker push azzulhisham/py-strm-tss-linux:v1.03
+
+# deploy to kubernetes
+kubectl apply -f deployment_streamlit.yaml -n system-py
+
+

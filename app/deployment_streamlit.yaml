@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: py-strm-tss-linux
+  labels:
+    app: py-strm-tss-linux
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: py-strm-tss-linux
+  template:
+    metadata:
+      labels:
+        app: py-strm-tss-linux
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+      containers:
+      - name: py-strm-tss-linux
+        image: azzulhisham/py-strm-tss-linux:v1.03
+        ports:
+        - containerPort: 8080
+        env:
+        - name: FLASK_ENV
+          value: "production"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: py-strm-tss-linux-service
+  labels:
+    app: py-strm-tss-linux
+spec:
+  selector:
+    app: py-strm-tss-linux
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: LoadBalancer

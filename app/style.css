@@ -1,0 +1,195 @@
+.block-container {
+    padding-top: 0 !important;
+    padding-left: 30px !important;
+    padding-right: 30px !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+    width: 100% !important;
+} 
+ 
+#deckgl-wrapper {
+    height: 750px !important;
+}
+
+.mapboxgl-ctrl {
+    margin-top: 50px !important;
+}
+
+.card {
+    display: flex;
+    justify-content: space-between;
+    flex-direction: column;
+    border-radius: 10px;
+    padding: 0px;
+    margin-bottom: 10px;
+    height: 120px; 
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.card1-color {
+    background-color: rgb(150, 150, 0); 
+}
+
+.card2-color {
+    background-color: rgb(39, 131, 183); 
+}
+
+.card3-color {
+    background-color: rgb(41, 178, 9);
+}
+
+.card4-color {
+    background-color: rgb(146, 113, 17);
+}
+
+.card5-color {
+    background-color: rgb(152, 86, 96);
+}
+
+.card6-color {
+    background-color: rgb(125, 9, 178);
+}
+
+.card-title {
+    font-size: 20px;
+    font-weight: 800;
+    padding-left: 16px;
+    height: 100%;
+    width: 100%;
+    color: whitesmoke;
+}
+
+.card-text {
+    font-size: 36px;
+    text-align: center;
+    width: 50%;
+    color: whitesmoke;
+}
+
+.card-label {
+    font-size: 20px;
+    font-weight: 100;
+    text-align: center;
+    width: 50%;
+    color: whitesmoke;
+}
+
+.card-det {
+    display: flex;
+    justify-content: space-between;
+    flex-direction: row;
+}
+
+.empty-div {
+    display: block;
+    height: 15px;
+}
+
+.legend-area {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-direction: row;
+    border-radius: 6px;
+    padding: 0px;
+    margin-bottom: 10px;
+    height: 60px; 
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: rgb(48, 48, 48);
+    border: 0.1px solid rgb(165, 165, 165);
+}
+
+#legend-title {
+    display: inline-block;
+    margin-left: 30px;
+    color: white;
+}
+
+#legend-items {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-direction: row;
+    margin-right: 60px;
+}
+
+.legend-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-direction: row;
+    margin-left: 10px;
+    margin-right: 50px;
+}
+
+#legend-cargo-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(182, 2, 254);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-tanker-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(3, 253, 69);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-tug-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(253, 248, 3);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-hs-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(253, 119, 3);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-hs-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(253, 119, 3);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-passenger-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(3, 236, 253);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+#legend-others-color {
+    display: inline-block;
+    height: 15px;
+    width: 15px;
+    background-color: rgb(222, 222, 222);
+    margin-left: 10px;
+    margin-right: 4px;
+}
+
+.legend-area-text {
+    display: inline-block;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    color: white;
+}
+
+
+

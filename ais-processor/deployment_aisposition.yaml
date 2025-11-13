@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: py-tss-aisposition-linux
+  labels:
+    app: py-tss-aisposition-linux
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: py-tss-aisposition-linux
+  template:
+    metadata:
+      labels:
+        app: py-tss-aisposition-linux
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+      containers:
+      - name: py-tss-aisposition-linux
+        image: azzulhisham/py-tss-aisposition-linux:v1.00
+        ports:
+        - containerPort: 8080
+        env:
+        - name: FLASK_ENV
+          value: "production"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: py-tss-aisposition-linux-service
+  labels:
+    app: py-tss-aisposition-linux
+spec:
+  selector:
+    app: py-tss-aisposition-linux
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: NodePort

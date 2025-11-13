@@ -1,0 +1,359 @@
+tssnorthbound = [
+    [100.81183434, 3.04546854],
+    [100.78857422, 3.01186991],
+    [100.92864990, 2.89426660],
+    [100.99096298, 2.82448741],
+    [101.16983414, 2.73207069],
+    [101.22819901, 2.69983461],
+    [101.43934250, 2.58854501],
+    [101.44878387, 2.58357190],
+    [101.61975861, 2.45152024],
+    [101.68893814, 2.39800985],
+    [101.83811188, 2.28069134],
+    [101.87999725, 2.25015950],
+    [101.99157715, 2.16267711],
+    [102.07672119, 2.08977126],
+    [102.25542068, 1.92902351],
+    [102.41214752, 1.85404837],
+    [102.73057938, 1.70168649],
+    [102.80336380, 1.66428046],
+    [102.99957275, 1.53077984],
+    [103.17449570, 1.40859717],
+    [103.20505142, 1.38783233],
+    [103.39817047, 1.22960188],
+    [103.47301483, 1.20351523],
+    [103.49387169, 1.23831167],
+    [103.42082977, 1.25427241],
+    [103.33379745, 1.34085335],
+    [103.28358650, 1.39109294],
+    [103.28144073, 1.39606965],
+    [103.24710846, 1.42936183],
+    [103.17449570, 1.49182627],
+    [103.09656143, 1.56063806],
+    [103.00008774, 1.64386126],
+    [102.74688721, 1.75624996],
+    [102.62483597, 1.81115498],
+    [102.49214172, 1.87069073],
+    [102.27653503, 1.96711031],
+    [102.10521698, 2.12185026],
+    [102.10298538, 2.11996328],
+    [102.01698303, 2.19372537],
+    [101.99209213, 2.21671096],
+    [101.94917679, 2.25015950],
+    [101.94660187, 2.25067409],
+    [101.79759979, 2.36748054],
+    [101.71588898, 2.43162560],
+    [101.71382904, 2.42973902],
+    [101.64567947, 2.48290515],
+    [101.64430618, 2.48513466],
+    [101.52122498, 2.58065662],
+    [101.52122498, 2.58271446],
+    [101.46646500, 2.62558549],
+    [101.42389297, 2.64856375],
+    [101.40689850, 2.65559433],
+    [101.24879837, 2.73961518],
+    [101.24811172, 2.73858639],
+    [101.18974686, 2.77236458],
+    [100.99868774, 2.87540778],
+    [100.99473953, 2.87832234],
+    [100.81183434, 3.04546854]
+]
+
+tss_northbound = [{
+    "polygon": [[[lng, lat] for lng, lat in tssnorthbound]],
+    "name": "TSS-Northbound"
+}]
+
+tssNouthbound_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lng, lat in tssnorthbound]]
+}
+
+tsssouthbound = [
+    [100.78385353, 3.00488435],
+    [100.90719223, 2.90236723],
+    [100.91860771, 2.89276648],
+    [100.92882156, 2.88247987],
+    [100.98993301, 2.81741496],
+    [101.11541748, 2.74994592],
+    [101.16545677, 2.72319728],
+    [101.22510910, 2.69370451],
+    [101.29875183, 2.65503703],
+    [101.30235672, 2.65220765],
+    [101.37248039, 2.61508222],
+    [101.42766953, 2.58738747],
+    [101.53521538, 2.50232741],
+    [101.61194801, 2.44110132],
+    [101.67975426, 2.38638993],
+    [101.85819626, 2.24844421],
+    [101.98282242, 2.15049779],
+    [102.06418991, 2.07604743],
+    [102.24666595, 1.91358267],
+    [102.54690170, 1.77169216],
+    [102.79975891, 1.65141124],
+    [102.99991608, 1.52031221],
+    [103.20505142, 1.38680267],
+    [103.38752747, 1.22119240],
+    [103.45636368, 1.17502558],
+    [103.44451904, 1.15408722],
+    [103.37757111, 1.19390430],
+    [103.23337555, 1.32244764],
+    [103.18239212, 1.36775376],
+    [102.98103333, 1.49011024],
+    [102.77812958, 1.61417585],
+    [102.53213882, 1.72999792],
+    [102.29764938, 1.84015102],
+    [102.22297668, 1.87532311],
+    [102.03826904, 2.04748431],
+    [101.95724487, 2.11936288],
+    [101.65477753, 2.35744689],
+    [101.38732910, 2.56702330],
+    [101.14528656, 2.68740291],
+    [100.89706421, 2.81771500],
+    [100.71613312, 2.91269651],
+    [100.78385353, 3.00488435]
+]
+
+tss_southbound = [{
+    "polygon": [[[lng, lat] for lng, lat in tsssouthbound]],
+    "name": "TSS-Southbound"
+}]
+
+tssSouthbound_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lng, lat in tsssouthbound]]
+}
+
+
+restrictedlimit = [
+    [2.283333333333333,104.565],
+    [2.2838644444444443,104.95033277777777],  
+    [1.690276111111111, 104.95033277777777],
+    [1.6895897222222223, 104.56306444444444], 
+    [2.283333333333333,104.565] 
+]
+
+restrictedlimit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in restrictedlimit]]
+}
+
+restricted_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in restrictedlimit]],
+    "name": "restricted-limit"
+}]
+
+
+sector1limit = [
+    [2.9,100.66666666666667],
+    [3.066666666666667, 100.96666666666667],  
+    [2.9, 101.21666666666667], 
+    [2.9,100.66666666666667] 
+]
+
+sector1limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector1limit]]
+}
+
+sector1_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector1limit]],
+    "name": "sector1-limit"
+}]
+
+sector2limit = [
+    [2.9,100.66666666666667],  
+    [2.35, 101.35],
+    [2.6333333333333333, 101.63333333333334],
+    [2.9, 101.21666666666667], 
+    [2.9,100.66666666666667] 
+]
+
+sector2limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector2limit]]
+}
+
+sector2_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector2limit]],
+    "name": "sector2-limit"
+}]
+
+
+sector3limit = [ 
+    [2.35, 101.35],
+    [1.85, 101.81666666666666], 
+    [2.1666666666666665, 102.2],
+    [2.6333333333333333, 101.63333333333334],
+    [2.35, 101.35]
+]
+
+sector3limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector3limit]]
+}
+
+sector3_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector3limit]],
+    "name": "sector3-limit"
+}]
+
+sector4limit = [ 
+    [1.85, 101.81666666666666], 
+    [1.5750099, 102.38333333333334],
+    [1.9, 102.65],
+    [2.1666666666666665, 102.2],
+    [1.85, 101.81666666666666]
+]
+
+sector4limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector4limit]]
+}
+
+sector4_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector4limit]],
+    "name": "sector4-limit"
+}]
+
+
+sector5limit = [ 
+    [1.5750099, 102.38333333333334],
+    [1.1666666666666667, 102.98333333333333],
+    [1.5666666666666667, 103.31666666666666],
+    [1.9, 102.65],
+    [1.5750099, 102.38333333333334]
+]
+
+sector5limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector5limit]]
+}
+
+sector5_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector5limit]],
+    "name": "sector5-limit"
+}]
+
+
+
+sector6limit = [ 
+    [1.1666666666666667, 102.98333333333333],
+    [1.1666666666666667, 103.41666666666667],
+    [1.25, 103.5],
+    [1.5666666666666667, 103.31666666666666],
+    [1.1666666666666667, 102.98333333333333]
+]
+
+sector6limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector6limit]]
+}
+
+sector6_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector6limit]],
+    "name": "sector6-limit"
+}]
+
+
+sector7limit = [ 
+    [1.1666666666666667, 103.41666666666667],
+    [0.95, 103.75],
+    [1.1833333333333333, 103.75],
+    [1.25, 103.5],
+    [1.1666666666666667, 103.41666666666667]
+]
+
+sector7limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector7limit]]
+}
+
+sector7_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector7limit]],
+    "name": "sector7-limit"
+}]
+
+sector8limit = [ 
+    [0.95, 103.75],
+    [1.1666666666666667, 104.03333333333333],
+    [1.3333333333333333, 104.03333333333333],
+    [1.1833333333333333, 103.75],
+    [0.95, 103.75]
+]
+
+sector8limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector8limit]]
+}
+
+sector8_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector8limit]],
+    "name": "sector8-limit"
+}]
+
+sector9limit = [ 
+    [1.1666666666666667, 104.03333333333333],
+    [1.2, 104.38333333333334],
+    [1.5, 104.38333333333334],
+    
+    [1.3333333333333333, 104.03333333333333],
+    [1.1666666666666667, 104.03333333333333]
+]
+
+sector9limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector9limit]]
+}
+
+sector9_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector9limit]],
+    "name": "sector9-limit"
+}]
+
+
+def get_entire_tss_region_setting():
+    reg_list = [tssnorthbound, tsssouthbound, sector1limit, sector2limit, sector3limit, sector4limit, sector5limit, sector6limit]
+
+    lat_list = []
+    lng_list = []
+
+    for idx, region in enumerate(reg_list):
+        for y, x in region:
+            lat_list.append(y if idx >= 2 else x)
+            lng_list.append(x if idx >= 2 else y)
+
+    
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [min(lng_list)-0.095, max(lat_list)+0.300], 
+            [max(lng_list)+0.200, max(lat_list)+0.300], 
+            [max(lng_list)+0.200, min(lat_list)-0.100], 
+            [min(lng_list)-0.095, min(lat_list)-0.100], 
+            [min(lng_list)-0.095, max(lat_list)+0.300]
+        ]]
+    }
+
+def get_entire_sector789_region_setting():
+    reg_list = [sector7limit, sector8limit, sector9limit]
+
+    lat_list = []
+    lng_list = []
+
+    for idx, region in enumerate(reg_list):
+        for y, x in region:
+            lat_list.append(y)
+            lng_list.append(x)
+
+    
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [min(lng_list)-0.095, max(lat_list)+0.095], 
+            [max(lng_list)+0.095, max(lat_list)+0.095], 
+            [max(lng_list)+0.095, min(lat_list)-0.095], 
+            [min(lng_list)-0.095, min(lat_list)-0.095], 
+            [min(lng_list)-0.095, max(lat_list)+0.095]
+        ]]
+    }    

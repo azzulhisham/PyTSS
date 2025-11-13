@@ -1,0 +1,11 @@
+.ipynb_checkpoints/
+ais-processor/venv/
+analyzer/venv/
+app/venv/
+
+analyzer/__pycache__/
+app/__pycache__/
+ais-processor/__pycache__/
+
+
+

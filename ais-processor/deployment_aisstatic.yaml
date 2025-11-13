@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: py-tss-aisstatic-linux
+  labels:
+    app: py-tss-aisstatic-linux
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: py-tss-aisstatic-linux
+  template:
+    metadata:
+      labels:
+        app: py-tss-aisstatic-linux
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+      containers:
+      - name: py-tss-aisstatic-linux
+        image: azzulhisham/py-tss-aisstatic-linux:v1.00
+        ports:
+        - containerPort: 8080
+        env:
+        - name: FLASK_ENV
+          value: "production"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: py-tss-aisstatic-linux-service
+  labels:
+    app: py-tss-aisstatic-linux
+spec:
+  selector:
+    app: py-tss-aisstatic-linux
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: NodePort
