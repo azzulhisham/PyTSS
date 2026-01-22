@@ -146,7 +146,7 @@ def get_ais_position_data():
     """)
 
     # Define parameters
-    params = {"lat_min": -90, "lat_max": 90, "ts_min": datetime.now(UTC) - timedelta(days=5)}
+    params = {"lat_min": -90, "lat_max": 90, "ts_min": datetime.now(UTC) - timedelta(days=2)}
     df = pd.read_sql(query, con=get_pgEngine(), params=params)  
 
     return df
@@ -182,11 +182,15 @@ def upsert_ais_position(data):
         ORDER BY "tsDetected" DESC
     """)
 
-    df = pd.read_sql(query, con=get_pgEngine())  
-    current_vessels_zone = df.to_dict(orient='records')   
+    try:
+        df = pd.read_sql(query, con=get_pgEngine())  
+        current_vessels_zone = df.to_dict(orient='records')   
 
-    del df
-    gc.collect()
+        del df
+        gc.collect()
+    except:
+        logging.info(f'Error reading database....')
+        return 0
 
 
     with Session(get_pgEngine()) as session:
@@ -208,7 +212,7 @@ def upsert_ais_position(data):
                         logging.info(f"[UPDATE] :: vessel {i['mmsi']} in zone {existing_vessel_zone['zone']}")
                         
                         if pd.isnull(existing_vessel_zone['tsOut']): 
-                            if datetime.now() - existing_vessel_zone['tsDetected'] > timedelta(hours=6) and (existing_vessel_zone['zone'] == 10 or existing_vessel_zone['zone'] == 11):
+                            if datetime.now() - existing_vessel_zone['tsDetected'] > timedelta(days=3) and existing_vessel_zone['zone'] <= 11:
                                 existing_vessel_zone['tsOut'] = datetime.now() 
                             else:
                                 existing_vessel_zone['tsOut'] = None 
@@ -263,12 +267,71 @@ def upsert_ais_position(data):
         if len(items_to_insert) != 0: session.bulk_insert_mappings(Ais_VesselInZone, items_to_insert)
         if len(items_to_update) != 0 or len(items_to_insert) != 0: session.commit() 
 
-        logging.info(f'Upserting data done....')
-        
-        del data
-        gc.collect()
 
-        return 0            
+    logging.info(f'Upserting data done....')
+    
+    del data
+    gc.collect()
+
+    return 0            
+
+
+def chk_invalid_data():
+    logging.info(f'Clearing invalid data....')
+
+    current_vessels_inrec = []
+
+    query = text("""
+        SELECT *
+        FROM public.ais_position
+        WHERE mmsi in (
+            SELECT mmsi
+            FROM public.ais_vesselinzone
+            WHERE "tsOut" IS NULL
+                AND "tsDetected" < NOW() - INTERVAL '5 days'
+        )
+    """)
+
+    try:
+        df = pd.read_sql(query, con=get_pgEngine())  
+        current_vessels_inrec = df.to_dict(orient='records')   
+
+        for idx, itm in enumerate(current_vessels_inrec):
+            rslt = duckdb.sql(f'''
+                SELECT ST_Within(ST_Point({itm['longitude']}, {itm['latitude']}), ST_GeomFromGeoJSON({entire_tss_region})) as within_area
+            ''').fetchall()       
+
+            in_zone = rslt[0][0]  
+
+            if not in_zone:
+                with get_pgEngine().connect() as conn:
+                    # Write your raw SQL UPDATE statement
+                    update_qry = text(f"""
+                        UPDATE public.ais_vesselinzone
+                        SET "tsOut" = now()   
+                        WHERE mmsi = :mmsi
+                            AND "tsOut" IS NULL
+                            AND "tsDetected" < NOW() - INTERVAL '5 days'
+                    """)
+
+                    # Execute the statement with parameters
+                    conn.execute(update_qry, {
+                        "mmsi": itm['mmsi']
+                    })
+
+                    # Commit the transaction
+                    print(f'Updating data for mmsi: {itm["mmsi"]}')
+                    conn.commit()  
+
+
+        del df
+        gc.collect()  
+
+    except:
+        pass
+
+
+    return 0
 
 
 if __name__ == "__main__":
@@ -283,6 +346,8 @@ if __name__ == "__main__":
 
             del vessels_data
             gc.collect()
+
+            chk_invalid_data()
 
         except KeyboardInterrupt:
             runFlg = False

@@ -180,7 +180,7 @@ if __name__ == "__main__":
                 }]
 
                 df_health = pd.DataFrame.from_dict(health)
-                df_health.to_sql("db_health", con=engine, if_exists='append', index=False) 
+                df_health.to_sql("db_health_b", con=engine, if_exists='append', index=False) 
 
 
 
