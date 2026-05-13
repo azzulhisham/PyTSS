@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, UTC
 
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import and_, or_, desc, text
+from sqlalchemy import and_, or_, desc, text, Column, BigInteger
 
 import gc
 import os
@@ -14,6 +14,7 @@ import time
 import pandas as pd
 import duckdb
 import psycopg2
+import json
 import platform
 import logging
 
@@ -51,7 +52,22 @@ zones = [
     sector8limit_db,
     sector9limit_db,
     tssNouthbound_db,
-    tssSouthbound_db
+    tssSouthbound_db,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    sector101limit_db,
+    sector102limit_db,
+    sector103limit_db,
+    sector104limit_db,
+    sector105limit_db,
+    sector106limit_db
 ]
 
 
@@ -75,7 +91,12 @@ class Ais_Position(SQLModel, table=True):
 
 
 class Ais_VesselInZone(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
+    # id: Optional[int] = Field(default=None, primary_key=True)
+    id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True)
+    )
+
     tsDetected: datetime
     mmsi: int = Field(index=True)
     navStatus: int
@@ -200,6 +221,8 @@ def upsert_ais_position(data):
             # ais_position = Ais_Position(**i)   
 
             for idx, zone in enumerate(zones):
+                if zone == None: continue
+
                 rslt = duckdb.sql(f'''
                     SELECT ST_Within(ST_Point({i['longitude']}, {i['latitude']}), ST_GeomFromGeoJSON({zone})) as within_area
                 ''').fetchall()       
@@ -212,7 +235,7 @@ def upsert_ais_position(data):
                         logging.info(f"[UPDATE] :: vessel {i['mmsi']} in zone {existing_vessel_zone['zone']}")
                         
                         if pd.isnull(existing_vessel_zone['tsOut']): 
-                            if datetime.now() - existing_vessel_zone['tsDetected'] > timedelta(days=3) and existing_vessel_zone['zone'] <= 11:
+                            if datetime.now() - existing_vessel_zone['tsDetected'] > timedelta(days=6) and existing_vessel_zone['zone'] <= 11:
                                 existing_vessel_zone['tsOut'] = datetime.now() 
                             else:
                                 existing_vessel_zone['tsOut'] = None 
@@ -320,7 +343,7 @@ def chk_invalid_data():
                     })
 
                     # Commit the transaction
-                    print(f'Updating data for mmsi: {itm["mmsi"]}')
+                    logging.info(f'Updating data for mmsi: {itm["mmsi"]}')
                     conn.commit()  
 
 

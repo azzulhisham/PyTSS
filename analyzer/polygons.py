@@ -312,6 +312,138 @@ sector9_limit = [{
 }]
 
 
+sector101limit = [
+    [3.01304167, 100.84724444],
+    [2.90918611, 100.96231389],
+    [2.90863333, 100.66304722],
+    [3.01304167, 100.84724444]
+]
+
+sector101limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector101limit]]
+}
+
+sector101_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector101limit]],
+    "name": "sector101-limit"
+}]
+
+
+sector102limit = [
+    [2.90841389, 100.72223889],
+    [2.90841389, 100.96160833],
+    [2.87501389, 100.99794444],
+    [2.62320556, 101.46500000],
+    [2.55596389, 101.55196389],
+    [2.48788333, 101.48298611],
+    [2.56264722, 101.38766389],
+    [2.90841389, 100.72223889]
+]
+
+sector102limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector102limit]]
+}
+
+sector102_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector102limit]],
+    "name": "sector102-limit"
+}]
+
+
+sector103limit = [
+    [2.55586389, 101.55186667],
+    [2.48396389, 101.64454722],
+    [2.43030278, 101.71334722],
+    [2.19386667, 102.01478333],
+    [2.12026667, 102.10132778],
+    [2.08038333, 102.14601944],
+    [1.99066944, 102.01179167],
+    [2.20153056, 101.61286111],
+    [2.36872778, 101.61499167],
+    [2.39868889, 101.60071111],
+    [2.48903056, 101.48549167],
+    [2.55586389, 101.55186667]
+]
+
+sector103limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector103limit]]
+}
+
+sector103_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector103limit]],
+    "name": "sector103-limit"
+}]
+
+
+sector104limit = [
+    [2.07993056, 102.14615556],
+    [1.96469167, 102.27541667],
+    [1.82553889, 102.58518056],
+    [1.73779167, 102.51450000],
+    [1.87685278, 102.22017500],
+    [1.99066389, 102.01124444],
+    [2.07993056, 102.14615556]
+]
+
+sector104limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector104limit]]
+}
+
+sector104_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector104limit]],
+    "name": "sector104-limit"
+}]
+
+
+sector105limit = [
+    [1.82568611, 102.58512500],
+    [1.63989722, 102.99835000],
+    [1.44951667, 103.22039444],
+    [1.37870000, 103.16443333],
+    [1.61318333, 102.78000278],
+    [1.73804444, 102.51456111],
+    [1.82568611, 102.58512500]
+]
+
+sector105limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector105limit]]
+}
+
+sector105_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector105limit]],
+    "name": "sector105-limit"
+}]
+
+
+sector106limit = [
+    [1.44951944, 103.21998611],
+    [1.37860000, 103.16441944],
+    [1.36674444, 103.18376389],
+    [1.19279167, 103.37820556],
+    [1.16800000, 103.41992500],
+    [1.23738889, 103.49323889],
+    [1.25185556, 103.42088056],
+    [1.42867778, 103.24445556],
+    [1.44951944, 103.21998611]
+]
+
+sector106limit_db = {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat] for lat, lng in sector106limit]]
+}
+
+sector106_limit = [{
+    "polygon": [[[lng, lat] for lat, lng in sector106limit]],
+    "name": "sector106-limit"
+}]
+
+
+
 def get_entire_tss_region_setting():
     reg_list = [tssnorthbound, tsssouthbound, sector1limit, sector2limit, sector3limit, sector4limit, sector5limit, sector6limit]
 

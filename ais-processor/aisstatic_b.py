@@ -99,74 +99,135 @@ def get_ais_position_data():
     
     return results
 
+def get_pg_static_data():
+    query = text("""
+        SELECT *
+        FROM public.ais_staticb
+        ORDER BY "ts"
+    """)
 
-def get_data_CH(vessels_data):
+    # Define parameters
+    # params = {"lat_min": -90, "lat_max": 90}
+
+    df = pd.read_sql(query, con=get_pgEngine())  
+    # results = df.to_dict(orient='records')  
+
+    # del df
+    # gc.collect()
+    
+    return df
+
+
+def get_data_CH():
     client = clickhouse_connect.get_client(
         host='43.216.85.155',
         user='default'
     )
 
-    data_ch = []
 
     try:
-        logging.info(f'Retrieving data from CH....')
-        cnt = 0
-        tot = len(vessels_data)
+        logging.info(f'Retrieving data from CH...')
 
-        for i in vessels_data:
-            qry = f'''
-                WITH static_data AS (
-                    SELECT ts, mmsi, shipType, shipTypeDesc, shipName, callsign, vendor, serial, model, to_bow, to_stern, to_port, to_starboard, '' AS destination,
-                        row_number() OVER (PARTITION BY mmsi ORDER BY ts DESC) AS rowcountby_mmsi 
-                    FROM pnav.ais_type24
-                    WHERE  ts >= date_add(MINUTE, -6, now()) AND mmsi = {i['mmsi']} 
-                )
-                SELECT *
-                FROM static_data
-                WHERE rowcountby_mmsi = 1
-                ORDER BY ts
-            '''
+        qry = f'''
+            WITH static_part1 AS (
+                SELECT DISTINCT mmsi, shipType, shipTypeDesc, callsign
+                FROM pnav.ais_type24
+                WHERE  ts >= date_add(DAY, -30, now()) AND partNo = 1                
+            ),        
+            static_data AS (
+                SELECT ts, mmsi, shipType, shipTypeDesc, shipName, '' AS callsign, 0 AS vendor, 0 AS serial, 0 AS model, to_bow, to_stern, to_port, to_starboard, '' AS destination,
+                    row_number() OVER (PARTITION BY mmsi ORDER BY ts DESC) AS rowcountby_mmsi 
+                FROM pnav.ais_type19
+                WHERE  ts >= date_add(MINUTE, -15, now()) 
+                
+                UNION ALL
+                
+                SELECT ts, mmsi, sp1.shipType, sp1.shipTypeDesc, shipName, sp1.callsign, 0 AS vendor, 0 AS serial, 0 AS model, to_bow, to_stern, to_port, to_starboard, '' AS destination,
+                    row_number() OVER (PARTITION BY mmsi ORDER BY ts DESC) AS rowcountby_mmsi 
+                FROM pnav.ais_type24
+                JOIN static_part1 AS sp1 ON sp1.mmsi = mmsi
+                WHERE  ts >= date_add(DAY, -30, now()) AND partNo = 0   
+            )
+            SELECT *
+            FROM static_data
+            WHERE rowcountby_mmsi = 1
+            ORDER BY ts
+        '''
 
-            result = client.query(qry) 
-            cnt += 1   
-
-            if result.row_count > 0:
-                logging.info(f'Transform data....{((cnt/tot) * 100):.2f}%')
-                df = pd.DataFrame(result.result_rows)
-                df.columns = list(result.column_names)
-
-                df['ts'] = pd.to_datetime(df['ts'])      
-                payloads = df.to_dict(orient='records')  
-
-                data_ch.append(payloads[0]) 
+        result = client.query(qry) 
 
 
-            time.sleep(0)
+        if result.row_count > 0:
+            df = pd.DataFrame(result.result_rows)
+            df.columns = list(result.column_names)
+
+            df['ts'] = pd.to_datetime(df['ts'])      
+            payloads = df.to_dict(orient='records')  
             
 
-        return data_ch
+        return payloads
           
     except Exception as e:
         logging.info(f'Error retrieving data from CH....{e}')
         return None
 
 
-def upsert_ais_static(static_data):
+def upsert_ais_static(ais_static_data, pg_static_data):
     logging.info(f'Upserting data....')
 
     items_to_update = []
     items_to_insert = []
+    det_changed = []
 
     try:
-        with Session(get_pgEngine()) as session:
-            for i in static_data:
-                # ais_position = Ais_Position(**i)
-                existing_ais: Ais_StaticB = session.exec(select(Ais_StaticB).where(Ais_StaticB.mmsi == i['mmsi'])).first()
+        pgEngine = get_pgEngine()
 
-                if existing_ais:
-                    dataid = {"id" : existing_ais.id}
+        with Session(pgEngine) as session:
+            for i in ais_static_data:
+                # ais_position = Ais_Position(**i)
+                # existing_ais: Ais_StaticB = session.exec(select(Ais_StaticB).where(Ais_StaticB.mmsi == i['mmsi'])).first()
+
+                existing_pg_static = duckdb.sql(f'''
+                    WITH pgstatic AS (
+                        SELECT *,
+                            row_number() OVER (PARTITION BY mmsi ORDER BY "ts" DESC) AS rowcount
+                        FROM pg_static_data
+                        WHERE mmsi = {i['mmsi']}
+                    )
+                    SELECT * 
+                    FROM pgstatic 
+                    WHERE rowcount = 1                    
+                ''').fetchdf() 
+
+                if len(existing_pg_static) > 0:
+                    existing_pg_static = existing_pg_static.to_dict(orient='records') 
+
+                    dataid = {"id" : existing_pg_static[0]['id']}
                     i.update(dataid)
                     items_to_update.append(i)
+
+
+                    # if str(i['callsign']).replace('@', '') != str(existing_pg_static[0]['callsign']).replace('@', ''):
+                    #     data = {
+                    #         "ts" : i['ts'],
+                    #         "imo": i['imo'],
+                    #         "detchg": "callsign",
+                    #         "prev": str(existing_pg_static[0]['callsign']).replace('@', ''),
+                    #         "cur": str(i['callsign']).replace('@', '')
+                    #     }
+
+                    #     det_changed.append(data)                      
+
+                    # elif i['shipName'].replace('@', '') != existing_pg_static[0]['shipName'].replace('@', ''):
+                    #     data = {
+                    #         "ts" : i['ts'],
+                    #         "imo": i['imo'],
+                    #         "detchg": "shipName",
+                    #         "prev": existing_pg_static[0]['shipName'].replace('@', ''),
+                    #         "cur": i['shipName'].replace('@', '')
+                    #     }
+
+                    #     det_changed.append(data)  
 
                 else:
                     items_to_insert.append(i)
@@ -175,6 +236,9 @@ def upsert_ais_static(static_data):
             session.bulk_update_mappings(Ais_StaticB, items_to_update)
             session.bulk_insert_mappings(Ais_StaticB, items_to_insert)
             session.commit() 
+
+            dataset = pd.DataFrame.from_dict(det_changed)
+            dataset.to_sql("ais_staticb_evt", con=pgEngine, if_exists='append', index=False)             
 
             logging.info(f'Upserting data done....')
             return 0
@@ -194,11 +258,11 @@ if __name__ == "__main__":
     while runFlg:
         try:
             logging.info(f'Fetching positioning data....')
-            vessels_data = get_ais_position_data()
-            static_data = get_data_CH(vessels_data)
+            pg_static_data = get_pg_static_data()
+            ais_static_data = get_data_CH()
 
-            if static_data != None:
-                rslt = upsert_ais_static(static_data)
+            if ais_static_data != None:
+                rslt = upsert_ais_static(ais_static_data, pg_static_data)
 
         except KeyboardInterrupt:
             runFlg = False
@@ -208,5 +272,5 @@ if __name__ == "__main__":
 
 
         logging.info(f'System sleep....')
-        time.sleep(100)      
+        time.sleep(30)      
 

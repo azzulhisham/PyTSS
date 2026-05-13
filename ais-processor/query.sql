@@ -50,3 +50,18 @@ SELECT *
 FROM public.db_health
 order by ts desc
 limit 10
+
+
+WITH vesselzone AS (
+	SELECT *,
+		row_number() OVER (PARTITION BY vz."tsDetected", vz.mmsi ORDER BY vz."tsOut" DESC) AS rowcount
+	FROM public.ais_vesselinzone vz
+	WHERE vz.zone IN (10, 11)
+)
+select * from vesselzone 
+where vesselzone.rowcount > 1
+--where mmsi = 305458968
+--order by mmsi, "tsOut"
+delete 
+from public.ais_vesselinzone
+where id in (select id from vesselzone where vesselzone.rowcount > 1)

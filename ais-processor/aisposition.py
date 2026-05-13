@@ -169,7 +169,7 @@ if __name__ == "__main__":
                 if rslt == 0:
                     setData = payloads[len(payloads) - 1]['ts'].strftime("%Y-%m-%d %H:%M:%S")
                     logging.info(f'Set next start date....{setData}')
-                    set_sys_seriesid(seriesid_filepath, setData)
+                    set_sys_seriesid(seriesid_filepath, setData if result.row_count > 700 else '')
             
 
                 # save health check info to db
