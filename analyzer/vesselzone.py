@@ -106,6 +106,17 @@ class Ais_VesselInZone(SQLModel, table=True):
     tsCurrent: Optional[datetime] = Field(default=None)
     tsOut: Optional[datetime] = Field(default=None)
     zone: Optional[int] = Field(default=None)
+    imo: Optional[int] = Field(default=None)
+    shipType: Optional[int] = Field(default=None)
+    shipTypeDesc: Optional[str] = Field(default=None)
+    shipName: Optional[str] = Field(default=None)
+    callsign: Optional[str] = Field(default=None)
+    destination: Optional[str] = Field(default=None)
+    draught: Optional[float] = Field(default=None)
+    to_bow: Optional[int] = Field(default=None)
+    to_stern: Optional[int] = Field(default=None)
+    to_port: Optional[int] = Field(default=None)
+    to_starboard: Optional[int] = Field(default=None)
 
 
 
@@ -160,14 +171,16 @@ def get_ais_position_data():
     #     results = session.exec(statement).all()
 
     query = text("""
-        SELECT *
-        FROM public.ais_position
-        WHERE latitude >= :lat_min AND latitude <= :lat_max AND ts >= :ts_min
-        ORDER BY "ts"
+        SELECT p.*, s.imo, s."shipType", s."shipTypeDesc", s."shipName", s.callsign, 
+            s.destination, s.draught, s.to_bow, s.to_stern, s.to_port, s.to_starboard
+        FROM public.ais_position p
+		LEFT JOIN public.ais_static s ON s.mmsi = p.mmsi
+        WHERE p.latitude >= :lat_min AND p.latitude <= :lat_max AND p.ts >= NOW() - INTERVAL '2 DAYS'
+        ORDER BY p.ts
     """)
 
     # Define parameters
-    params = {"lat_min": -90, "lat_max": 90, "ts_min": datetime.now(UTC) - timedelta(days=2)}
+    params = {"lat_min": -90, "lat_max": 90}
     df = pd.read_sql(query, con=get_pgEngine(), params=params)  
 
     return df
@@ -187,6 +200,26 @@ def get_vessel_data():
     gc.collect()
 
     return df.to_dict(orient='records') 
+
+
+INT_COLUMNS = ("imo", "shipType", "to_bow", "to_stern", "to_port", "to_starboard")
+
+def clean_record(record):
+    # pandas turns NULL integer columns into NaN floats (e.g. imo=9312345.0),
+    # which PostgreSQL rejects on UPDATE; normalize back to None/int
+    cleaned = {}
+
+    for k, v in record.items():
+        if pd.isnull(v):
+            cleaned[k] = None
+
+        elif k in INT_COLUMNS:
+            cleaned[k] = int(v)
+
+        else:
+            cleaned[k] = v
+    
+    return cleaned
 
 
 def upsert_ais_position(data):
@@ -240,7 +273,7 @@ def upsert_ais_position(data):
                             else:
                                 existing_vessel_zone['tsOut'] = None 
                         
-                        payload = existing_vessel_zone.copy()      #.model_dump()
+                        payload = clean_record(existing_vessel_zone)      #.model_dump()
 
                         payload["longitude"] = i['longitude']
                         payload["latitude"] = i['latitude'] 
@@ -265,9 +298,9 @@ def upsert_ais_position(data):
                 else:                    
                     if existing_vessel_zone:
                         logging.info(f"[UPDATE] :: vessel {i['mmsi']} exit zone {existing_vessel_zone['zone']}")
-                        payload = existing_vessel_zone      #.model_dump()
+                        existing_vessel_zone["tsOut"] = i['ts']
 
-                        payload["tsOut"] = i['ts']                 
+                        payload = clean_record(existing_vessel_zone)      #.model_dump()
                         items_to_update.append(payload)                
 
 
