@@ -117,7 +117,12 @@ class Ais_VesselInZone(SQLModel, table=True):
     to_stern: Optional[int] = Field(default=None)
     to_port: Optional[int] = Field(default=None)
     to_starboard: Optional[int] = Field(default=None)
-
+    curlongitude: Optional[float] = Field(default=None)
+    curlatitude: Optional[float] = Field(default=None)
+    sog: Optional[float] = Field(default=None)
+    cog: Optional[float] = Field(default=None)
+    rot: Optional[float] = Field(default=None)
+    trueHeading: Optional[float] = Field(default=None)        
 
 
 # Database URL (adjust username, password, host, port, database name)
@@ -273,11 +278,17 @@ def upsert_ais_position(data):
                             else:
                                 existing_vessel_zone['tsOut'] = None 
                         
-                        payload = clean_record(existing_vessel_zone)      #.model_dump()
+                        payload = clean_record(existing_vessel_zone.copy())      #.model_dump()
 
                         payload["longitude"] = i['longitude']
                         payload["latitude"] = i['latitude'] 
-                        payload["tsCurrent"] = i['ts']                                     
+                        payload["tsCurrent"] = i['ts']   
+                        payload["destination"] = i['destination'] if payload["destination"] in (None, "") and i['destination'] not in (None, "") else payload["destination"] 
+                        payload["sog"] = i['sog'] if payload["sog"] in (None, "") and i['sog'] not in (None, "") else payload["sog"]
+                        payload["cog"] = i['cog'] if payload["cog"] in (None, "") and i['cog'] not in (None, "") else payload["cog"]
+                        payload["rot"] = i['rot'] if payload["rot"] in (None, "") and i['rot'] not in (None, "") else payload["rot"]
+                        payload["trueHeading"] = i['trueHeading'] if payload["trueHeading"] in (None, "") and i['trueHeading'] not in (None, "") else payload["trueHeading"]
+
                         items_to_update.append(payload)                         
 
                     else:
@@ -291,7 +302,24 @@ def upsert_ais_position(data):
                             "latitude": i['latitude'], 
                             "tsCurrent": i['ts'],
                             "tsOut": None,
-                            "zone": idx                       
+                            "zone": idx,
+                            "imo": i['imo'],
+                            "shipType": i['shipType'],
+                            "shipTypeDesc": i['shipTypeDesc'],
+                            "shipName": i['shipName'],
+                            "callsign": i['callsign'],
+                            "destination": i['destination'],    
+                            "draught": i['draught'],
+                            "to_bow": i['to_bow'],
+                            "to_stern": i['to_stern'],
+                            "to_port": i['to_port'],
+                            "to_starboard": i['to_starboard'],
+                            "curlongitude": i['longitude'],
+                            "curlatitude": i['latitude'],
+                            "sog": i['sog'],
+                            "cog": i['cog'],
+                            "rot": i['rot'],
+                            "trueHeading": i['trueHeading']       
                         }
 
                         items_to_insert.append(new_vessel_zone)
@@ -300,7 +328,7 @@ def upsert_ais_position(data):
                         logging.info(f"[UPDATE] :: vessel {i['mmsi']} exit zone {existing_vessel_zone['zone']}")
                         existing_vessel_zone["tsOut"] = i['ts']
 
-                        payload = clean_record(existing_vessel_zone)      #.model_dump()
+                        payload = clean_record(existing_vessel_zone.copy())      #.model_dump()
                         items_to_update.append(payload)                
 
 
