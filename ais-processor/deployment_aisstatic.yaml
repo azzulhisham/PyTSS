@@ -31,6 +31,14 @@ spec:
         env:
         - name: FLASK_ENV
           value: "production"
+        - name: CH_HOST
+          value: "56.69.44.39"
+        - name: CH_USER
+          value: "default"
+        - name: CH_PSWD
+          value: "Pinc@200901029426"
+        - name: CH_PORT
+          value: "8123"
 ---
 apiVersion: v1
 kind: Service
