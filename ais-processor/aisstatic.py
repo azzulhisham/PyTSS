@@ -113,7 +113,11 @@ def _cfg(name: str) -> str:
 
 
 def _cfg_int(name: str) -> int:
-    return int(_cfg(name))
+    try:
+        return int(_cfg(name))
+    except ValueError:
+        logging.warning("Invalid int for %s, using default %s", name, _DEFAULTS[name])
+        return int(_DEFAULTS[name])
 
 
 def _cfg_bool(name: str) -> bool:

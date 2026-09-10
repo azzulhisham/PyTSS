@@ -1,0 +1,12 @@
+# Keep secrets out of the published image - config comes from the deployment env vars,
+# and the scripts fall back to in-code defaults when a variable is absent.
+.env
+.env.example
+
+# Never ship the local virtualenv (thousands of files, wrong platform)
+venv/
+__pycache__/
+*.pyc
+
+.git/
+.gitignore
