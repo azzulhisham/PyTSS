@@ -3,6 +3,9 @@ Sync latest AIS static data from ClickHouse -> Postgres public.ais_static.
 
 Identity key: IMO first (normalized 7-digit + check digit); if IMO is null/invalid, use MMSI.
 Also appends identity-change events to public.ais_static_evt.
+
+Skip upsert when callsign and all of to_bow/to_stern/to_port/to_starboard are
+blank, empty, null, or 0 (empty Message 5 shell).
 """
 
 from __future__ import annotations
@@ -267,6 +270,34 @@ def _clean_row(raw: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _is_blank_callsign(value: Any) -> bool:
+    if _is_null(value):
+        return True
+    text = str(value).replace("@", "").strip()
+    return text == "" or text == "0"
+
+
+def _is_blank_dimension(value: Any) -> bool:
+    if _is_null(value):
+        return True
+    try:
+        return int(value) == 0
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        return text == "" or text == "0"
+
+
+def should_skip_static_upsert(row: dict[str, Any]) -> bool:
+    """Skip empty/placeholder Message 5 shells (no callsign and no dimensions)."""
+    return (
+        _is_blank_callsign(row.get("callsign"))
+        and _is_blank_dimension(row.get("to_bow"))
+        and _is_blank_dimension(row.get("to_stern"))
+        and _is_blank_dimension(row.get("to_port"))
+        and _is_blank_dimension(row.get("to_starboard"))
+    )
+
+
 def dedupe_ch_static(df: pd.DataFrame) -> pd.DataFrame:
     """Latest row per IMO when valid; otherwise latest per MMSI."""
     if df.empty:
@@ -422,12 +453,16 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
     items_to_update: list[dict[str, Any]] = []
     items_to_insert: list[dict[str, Any]] = []
     det_changed: list[dict[str, Any]] = []
+    skipped = 0
 
     try:
         engine = get_pg_engine()
         with Session(engine) as session:
             for raw in ais_static_data:
                 row = _clean_row(raw)
+                if should_skip_static_upsert(row):
+                    skipped += 1
+                    continue
                 existing = _find_existing(row, by_imo, by_mmsi)
 
                 if existing is not None:
@@ -461,9 +496,10 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
             )
 
         logging.info(
-            "Upsert done: update=%s insert=%s events=%s",
+            "Upsert done: update=%s insert=%s skipped=%s events=%s",
             len(items_to_update),
             len(items_to_insert),
+            skipped,
             len(det_changed),
         )
         return 0
