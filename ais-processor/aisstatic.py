@@ -6,6 +6,12 @@ Also appends identity-change events to public.ais_static_evt.
 
 Skip upsert when callsign and all of to_bow/to_stern/to_port/to_starboard are
 blank, empty, null, or 0 (empty Message 5 shell).
+
+Noise control (RF / one-off Type 5 bursts):
+  1. One CH row per MMSI: if any valid-IMO message exists, drop null-IMO copies.
+  2. Majority identity in the lookback window (not last-wins).
+  3. Never insert a null-IMO row when Postgres already has that MMSI with a valid IMO.
+  4. Skip a one-off identity jump (same callsign, IMO/name glitch vs existing row).
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ _DEFAULTS = {
     "CH_LOOKBACK_MINUTES": "30",
     "LOOP_SLEEP_SEC": "60",
     "IMO_CHECK_DIGIT": "1",
+    "STATIC_MIN_IDENTITY_VOTES": "2",
 }
 
 # Compared for ais_static_evt (AIS msg 5 / static fields).
@@ -140,6 +147,7 @@ CH_PSWD = _cfg("CH_PSWD")
 CH_LOOKBACK_MINUTES = _cfg_int("CH_LOOKBACK_MINUTES")
 LOOP_SLEEP_SEC = _cfg_int("LOOP_SLEEP_SEC")
 IMO_CHECK_DIGIT = _cfg_bool("IMO_CHECK_DIGIT")
+STATIC_MIN_IDENTITY_VOTES = max(1, _cfg_int("STATIC_MIN_IDENTITY_VOTES"))
 
 _pg_engine: Optional[Engine] = None
 _ch_client: Optional[Client] = None
@@ -231,6 +239,92 @@ def _norm_text(value: Any) -> str:
     return str(value).replace("@", "").strip()
 
 
+def _levenshtein(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    prev = list(range(len(right) + 1))
+    for i, ca in enumerate(left, 1):
+        cur = [i]
+        for j, cb in enumerate(right, 1):
+            cur.append(
+                min(
+                    cur[j - 1] + 1,
+                    prev[j] + 1,
+                    prev[j - 1] + (ca != cb),
+                )
+            )
+        prev = cur
+    return prev[-1]
+
+
+def _row_identity_key(row: pd.Series) -> tuple:
+    return (
+        normalize_imo(row.get("imo")),
+        _norm_text(row.get("shipName")).upper(),
+        _norm_text(row.get("callsign")).upper(),
+        _as_optional_int(row.get("to_bow")) or 0,
+    )
+
+
+def _pick_static_row_for_mmsi(grp: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """One row for this MMSI: drop null-IMO twins, then majority identity."""
+    if grp.empty:
+        return None
+    g = grp.copy()
+    g["_imo_norm"] = g["imo"].map(normalize_imo)
+    valid = g[g["_imo_norm"].notna()]
+    pool = valid if not valid.empty else g
+    if pool.empty:
+        return None
+    keys = pool.apply(_row_identity_key, axis=1)
+    counts = keys.value_counts()
+    top_n = int(counts.iloc[0])
+    if top_n >= STATIC_MIN_IDENTITY_VOTES:
+        pool = pool.loc[keys == counts.index[0]]
+    pool = pool.sort_values("ts")
+    return pool.iloc[[-1]].drop(columns=["_imo_norm"], errors="ignore")
+
+
+def _should_reject_as_noise(new_row: dict[str, Any], old_row: dict[str, Any]) -> bool:
+    """Skip a null-IMO twin or a one-off identity glitch vs the existing PG row."""
+    new_imo = _as_optional_int(new_row.get("imo"))
+    old_imo = normalize_imo(old_row.get("imo"))
+    old_mmsi = _as_optional_int(old_row.get("mmsi"))
+    new_mmsi = _as_optional_int(new_row.get("mmsi"))
+    if (
+        new_imo is None
+        and old_imo is not None
+        and old_mmsi is not None
+        and new_mmsi is not None
+        and old_mmsi == new_mmsi
+    ):
+        return True
+
+    old_cs = _norm_text(old_row.get("callsign"))
+    new_cs = _norm_text(new_row.get("callsign"))
+    if not old_cs or old_cs != new_cs:
+        return False
+    if old_imo and new_imo is None:
+        return True
+    if old_imo and new_imo and old_imo != new_imo:
+        return True
+    old_name = _norm_text(old_row.get("shipName"))
+    new_name = _norm_text(new_row.get("shipName"))
+    if (
+        old_name
+        and new_name
+        and old_name.upper() != new_name.upper()
+        and max(len(old_name), len(new_name)) >= 4
+        and _levenshtein(old_name.upper(), new_name.upper()) <= 2
+    ):
+        return True
+    return False
+
+
 def _values_differ(field: str, new_val: Any, old_val: Any) -> bool:
     if field in {"callsign", "shipName", "destination", "shipTypeDesc"}:
         return _norm_text(new_val) != _norm_text(old_val)
@@ -299,20 +393,18 @@ def should_skip_static_upsert(row: dict[str, Any]) -> bool:
 
 
 def dedupe_ch_static(df: pd.DataFrame) -> pd.DataFrame:
-    """Latest row per IMO when valid; otherwise latest per MMSI."""
+    """One row per MMSI: prefer valid IMO, then majority identity in the window."""
     if df.empty:
         return df
 
-    out = df.copy()
-    out["imo_norm"] = out["imo"].map(normalize_imo)
-    out = out.sort_values("ts")
-
-    with_imo = out[out["imo_norm"].notna()].drop_duplicates("imo_norm", keep="last")
-    without_imo = out[out["imo_norm"].isna()].drop_duplicates("mmsi", keep="last")
-
-    result = pd.concat([with_imo, without_imo], ignore_index=True)
-    result["imo"] = result["imo_norm"]
-    return result.drop(columns=["imo_norm"])
+    frames: list[pd.DataFrame] = []
+    for _, grp in df.groupby(df["mmsi"].astype(int), sort=False):
+        picked = _pick_static_row_for_mmsi(grp)
+        if picked is not None:
+            frames.append(picked)
+    if not frames:
+        return df.iloc[0:0].copy()
+    return pd.concat(frames, ignore_index=True)
 
 
 def get_data_ch() -> list[dict[str, Any]]:
@@ -351,15 +443,17 @@ def get_data_ch() -> list[dict[str, Any]]:
 def get_pg_static_for_batch(
     batch: list[dict[str, Any]],
 ) -> tuple[dict[int, dict], dict[int, dict]]:
-    """Load only Postgres rows needed for this batch. Returns (by_imo, by_mmsi_null_imo)."""
+    """Load Postgres rows for this batch. Returns (by_imo, by_mmsi).
+
+    by_mmsi prefers a valid-IMO row when the same MMSI exists twice.
+    """
     imos: set[int] = set()
     mmsis: set[int] = set()
     for raw in batch:
+        mmsis.add(int(raw["mmsi"]))
         imo = normalize_imo(raw.get("imo"))
         if imo is not None:
             imos.add(imo)
-        else:
-            mmsis.add(int(raw["mmsi"]))
 
     by_imo: dict[int, dict] = {}
     by_mmsi: dict[int, dict] = {}
@@ -368,12 +462,12 @@ def get_pg_static_for_batch(
 
     clauses: list[str] = []
     params: dict[str, Any] = {}
+    if mmsis:
+        clauses.append("mmsi = ANY(:mmsis)")
+        params["mmsis"] = list(mmsis)
     if imos:
         clauses.append("imo = ANY(:imos)")
         params["imos"] = list(imos)
-    if mmsis:
-        clauses.append("(imo IS NULL AND mmsi = ANY(:mmsis))")
-        params["mmsis"] = list(mmsis)
 
     query = text(f"""
         SELECT
@@ -393,6 +487,16 @@ def get_pg_static_for_batch(
             by_imo[imo] = rec
         elif mmsi is not None:
             rec["imo"] = None
+        if mmsi is None:
+            continue
+        prev = by_mmsi.get(mmsi)
+        rec_imo = _as_optional_int(rec.get("imo"))
+        prev_imo = None if prev is None else _as_optional_int(prev.get("imo"))
+        if prev is None:
+            by_mmsi[mmsi] = rec
+        elif rec_imo is not None and prev_imo is None:
+            by_mmsi[mmsi] = rec
+        elif rec_imo is not None or prev_imo is None:
             by_mmsi[mmsi] = rec
 
     return by_imo, by_mmsi
@@ -404,8 +508,8 @@ def _find_existing(
     by_mmsi: dict[int, dict],
 ) -> Optional[dict]:
     imo = _as_optional_int(row.get("imo"))
-    if imo is not None:
-        return by_imo.get(imo)
+    if imo is not None and imo in by_imo:
+        return by_imo[imo]
     mmsi = _as_optional_int(row.get("mmsi"))
     if mmsi is None:
         return None
@@ -454,6 +558,7 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
     items_to_insert: list[dict[str, Any]] = []
     det_changed: list[dict[str, Any]] = []
     skipped = 0
+    skipped_noise = 0
 
     try:
         engine = get_pg_engine()
@@ -464,6 +569,9 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
                     skipped += 1
                     continue
                 existing = _find_existing(row, by_imo, by_mmsi)
+                if existing is not None and _should_reject_as_noise(row, existing):
+                    skipped_noise += 1
+                    continue
 
                 if existing is not None:
                     payload = dict(row)
@@ -496,10 +604,11 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
             )
 
         logging.info(
-            "Upsert done: update=%s insert=%s skipped=%s events=%s",
+            "Upsert done: update=%s insert=%s skipped=%s noise=%s events=%s",
             len(items_to_update),
             len(items_to_insert),
             skipped,
+            skipped_noise,
             len(det_changed),
         )
         return 0
