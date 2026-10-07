@@ -7,6 +7,11 @@ Also appends identity-change events to public.ais_static_evt.
 Skip upsert when callsign and all of to_bow/to_stern/to_port/to_starboard are
 blank, empty, null, or 0 (empty Message 5 shell).
 
+A vessel stays in the ClickHouse lookback window for the whole window, so the
+same unchanged row is re-picked every cycle. Rows identical to what Postgres
+already holds are not rewritten, because Postgres creates a new row version even
+for a no-op UPDATE. Any real difference, including a newer ts, is still written.
+
 Noise control (RF / one-off Type 5 bursts):
   1. One CH row per MMSI: if any valid-IMO message exists, drop null-IMO copies.
   2. Majority identity in the lookback window (not last-wins).
@@ -516,6 +521,47 @@ def _find_existing(
     return by_mmsi.get(mmsi)
 
 
+def _ts_differs(new_val: Any, old_val: Any) -> bool:
+    if _is_null(new_val) or _is_null(old_val):
+        return not (_is_null(new_val) and _is_null(old_val))
+    new_ts = pd.Timestamp(new_val)
+    old_ts = pd.Timestamp(old_val)
+    if new_ts.tz is not None:
+        new_ts = new_ts.tz_convert("UTC").tz_localize(None)
+    if old_ts.tz is not None:
+        old_ts = old_ts.tz_convert("UTC").tz_localize(None)
+    return new_ts != old_ts
+
+
+def _static_row_differs(new_row: dict[str, Any], old_row: dict[str, Any]) -> bool:
+    """True when any stored column differs from the row already in Postgres.
+
+    A vessel transmits Message 5 every few minutes but stays in the
+    CH_LOOKBACK_MINUTES window for the whole window, so the same unchanged row
+    is re-picked cycle after cycle. Postgres never skips a no-op UPDATE: it
+    writes a new row version even when every value is identical. This compares
+    all of STATIC_COLS so an unchanged vessel costs one comparison instead of a
+    dead tuple, index entries and the WAL for both.
+
+    _collect_changes is deliberately not reused as the gate: it returns nothing
+    when the IMO is missing or a placeholder, and it only covers CHANGE_FIELDS,
+    so dimension and IMO edits would never be written.
+
+    Old rows arrive through pandas, where NULL becomes NaN and an integer can be
+    a float. Both sides go through the same normalisers _clean_row uses, so a
+    NULL compares equal to a None instead of looking like a change.
+    """
+    for field in ("shipTypeDesc", "shipName", "callsign", "destination"):
+        if _norm_text(new_row.get(field)) != _norm_text(old_row.get(field)):
+            return True
+    if _values_differ("draught", new_row.get("draught"), old_row.get("draught")):
+        return True
+    for field in ("mmsi", "shipType", "imo", "to_bow", "to_stern", "to_port", "to_starboard"):
+        if _as_optional_int(new_row.get(field)) != _as_optional_int(old_row.get(field)):
+            return True
+    return _ts_differs(new_row.get("ts"), old_row.get("ts"))
+
+
 def _collect_changes(new_row: dict[str, Any], old_row: dict[str, Any]) -> list[dict[str, Any]]:
     imo = _as_optional_int(new_row.get("imo"))
     # Skip identity-change events when there is no usable IMO
@@ -559,6 +605,7 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
     det_changed: list[dict[str, Any]] = []
     skipped = 0
     skipped_noise = 0
+    unchanged = 0
 
     try:
         engine = get_pg_engine()
@@ -571,6 +618,13 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
                 existing = _find_existing(row, by_imo, by_mmsi)
                 if existing is not None and _should_reject_as_noise(row, existing):
                     skipped_noise += 1
+                    continue
+
+                if existing is not None and not _static_row_differs(row, existing):
+                    # Identical to what is already stored, including ts. The
+                    # cached copy already matches, so later rows for the same
+                    # vessel in this batch still compare correctly.
+                    unchanged += 1
                     continue
 
                 if existing is not None:
@@ -604,8 +658,9 @@ def upsert_ais_static(ais_static_data: list[dict[str, Any]]) -> int:
             )
 
         logging.info(
-            "Upsert done: update=%s insert=%s skipped=%s noise=%s events=%s",
+            "Upsert done: update=%s unchanged=%s insert=%s skipped=%s noise=%s events=%s",
             len(items_to_update),
+            unchanged,
             len(items_to_insert),
             skipped,
             skipped_noise,

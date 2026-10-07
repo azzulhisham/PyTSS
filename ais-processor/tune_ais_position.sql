@@ -178,3 +178,31 @@ WHERE schemaname = 'public' AND relname IN ('ais_position', 'ais_positionb');
 --
 -- Re-check after a day with the query in section 3 before changing anything.
 -- ---------------------------------------------------------------------------
+
+
+-- ---------------------------------------------------------------------------
+-- 5) ais_static: same treatment, APPLIED 2026-10-07
+--
+-- Done after deploying the _static_row_differs gate in aisstatic.py, for the
+-- same reason as section 2: reclaiming while the old code still rewrote every
+-- row would re-bloat immediately.
+--
+--   ALTER TABLE public.ais_static SET (fillfactor = 70);   -- 0.010s
+--   VACUUM (FULL, ANALYZE) public.ais_static;              -- lock held 0.44s
+--     70 MB -> 8.4 MB  (heap 60 MB -> 6.1 MB, idx 10 MB -> 2.3 MB)
+--
+--   writes 35.0/sec -> 3.4/sec (-90.3%)
+--   per cycle update=2616 -> ~290, with ~2330 skipped as unchanged
+--   upsert wall time 13.0s -> ~2.0s, identity-change events unaffected
+--
+-- ais_static_evt is deliberately left at fillfactor 100: it is append-only
+-- (697k inserts, 0 updates lifetime), so reserving 30% free space per page
+-- would waste disk on updates that never come.
+--
+-- HOT% on ais_static reads 0 after this change. That is expected, not a
+-- regression: ix_ais_static_mmsi_ts covers (mmsi, ts DESC), so any genuine
+-- update moves ts and must touch that index. The old 82% HOT came from the
+-- no-op updates, which were trivially HOT-eligible precisely because nothing
+-- changed. Skipping a write entirely beats turning it into a HOT write, and
+-- non-HOT index churn still fell from ~6.2/sec to 3.4/sec.
+-- ---------------------------------------------------------------------------
