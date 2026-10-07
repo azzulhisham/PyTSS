@@ -1,11 +1,23 @@
 """
 Sync latest AIS class-B position data from ClickHouse -> Postgres public.ais_positionb.
 
-The table holds one row per MMSI. Each cycle writes with two batched statements
-per chunk instead of a query per row:
+The table holds one row per MMSI. Each cycle writes with batched statements
+instead of a query per row:
 
   1) UPDATE ... FROM (VALUES ...)  for MMSIs already present
   2) INSERT ... WHERE NOT EXISTS   for genuinely new MMSIs only
+
+A vessel stays in the live lookback window for many cycles, so the same fix is
+re-picked repeatedly. The UPDATE compares every data column and writes only
+when something actually differs, because Postgres otherwise creates a new row
+version for an identical write. ts is part of that comparison, so a stationary
+vessel reporting the same position with a fresh timestamp is still written; only
+an exact duplicate of the stored message is skipped. The MMSIs already present
+are read once per cycle, so the INSERT only sees genuinely new ones, and the
+heartbeat row shares the write transaction: one commit per cycle.
+
+Every setting has a default in _DEFAULTS below, so the script runs with no .env
+file and no environment variables. Anything set in the environment wins.
 
 INSERT ... ON CONFLICT is deliberately not used here: Postgres evaluates the id
 default (nextval) before it detects the conflict, so it consumes one sequence
@@ -72,6 +84,10 @@ _DEFAULTS = {
     "HEALTH_PURGE_INTERVAL_HOURS": "24",
     "HEALTH_PURGE_CHUNK": "10000",
     "HEALTH_PURGE_MAX_SECONDS": "60",
+    "PG_STATEMENT_TIMEOUT_MS": "30000",
+    "PG_LOCK_TIMEOUT_MS": "5000",
+    "CH_CONNECT_TIMEOUT_SEC": "15",
+    "CH_SEND_RECEIVE_TIMEOUT_SEC": "60",
 }
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -149,10 +165,13 @@ HEALTH_RETENTION_DAYS = _cfg_int("HEALTH_RETENTION_DAYS")
 HEALTH_PURGE_INTERVAL_HOURS = _cfg_int("HEALTH_PURGE_INTERVAL_HOURS")
 HEALTH_PURGE_CHUNK = _cfg_int("HEALTH_PURGE_CHUNK")
 HEALTH_PURGE_MAX_SECONDS = _cfg_int("HEALTH_PURGE_MAX_SECONDS")
+PG_STATEMENT_TIMEOUT_MS = _cfg_int("PG_STATEMENT_TIMEOUT_MS")
+PG_LOCK_TIMEOUT_MS = _cfg_int("PG_LOCK_TIMEOUT_MS")
+CH_CONNECT_TIMEOUT_SEC = _cfg_int("CH_CONNECT_TIMEOUT_SEC")
+CH_SEND_RECEIVE_TIMEOUT_SEC = _cfg_int("CH_SEND_RECEIVE_TIMEOUT_SEC")
 
 
-UPDATE_SQL = f"""
-UPDATE public.{PG_TABLE} AS t SET
+_SET_SQL = """\
     ts              = v.ts::timestamp,
     "navStatus"     = v.nav_status::integer,
     "navStatusDesc" = v.nav_status_desc::varchar,
@@ -161,13 +180,45 @@ UPDATE public.{PG_TABLE} AS t SET
     rot             = v.rot::double precision,
     cog             = v.cog::double precision,
     sog             = v.sog::double precision,
-    "trueHeading"   = v.true_heading::double precision
+    "trueHeading"   = v.true_heading::double precision"""
+
+_VALUES_SQL = """\
 FROM (VALUES %s) AS v(
     ts, mmsi, nav_status, nav_status_desc,
     longitude, latitude, rot, cog, sog, true_heading
-)
+)"""
+
+# A vessel stays inside the LIVE_LOOKBACK_MINUTES window for many cycles, so the
+# same newest fix is re-picked over and over. Postgres never skips a no-op
+# UPDATE by itself: it writes a new row version even when every value is
+# identical, which bloats the table and keeps autovacuum busy for nothing. This
+# predicate makes an unchanged vessel cost one comparison instead of a dead
+# tuple, two index entries and the WAL for both.
+#
+# ts is compared too, so a stationary vessel reporting the same position with a
+# fresh timestamp is still written: only a byte-identical duplicate is skipped.
+# The class-B constants (navStatus / navStatusDesc / rot) are included as well,
+# so a row left over from an older version is normalised on its first pass and
+# matches from then on. The table has no triggers, rules, publications or
+# dependent views, so a skipped identical write is not observable anywhere.
+_CHANGED_SQL = """\
+  AND (
+        t.ts, t."navStatus", t."navStatusDesc",
+        t.longitude, t.latitude, t.rot, t.cog, t.sog, t."trueHeading"
+      ) IS DISTINCT FROM (
+        v.ts::timestamp, v.nav_status::integer, v.nav_status_desc::varchar,
+        v.longitude::double precision, v.latitude::double precision,
+        v.rot::double precision, v.cog::double precision,
+        v.sog::double precision, v.true_heading::double precision
+      )"""
+
+UPDATE_SQL = f"""
+UPDATE public.{PG_TABLE} AS t SET
+{_SET_SQL}
+{_VALUES_SQL}
 WHERE t.mmsi = v.mmsi::integer
   AND t.ts  <= v.ts::timestamp
+{_CHANGED_SQL}
 """
 
 INSERT_SQL = f"""
@@ -204,42 +255,82 @@ WHERE ctid IN (
 )
 """
 
+# Which of this batch's MMSIs already have a row. Index-only scan on the unique
+# mmsi index, and it replaces the per-cycle WHERE NOT EXISTS probe over the
+# whole batch.
+EXISTING_MMSI_SQL = f"""
+SELECT mmsi
+FROM public.{PG_TABLE}
+WHERE mmsi = ANY(%s)
+"""
+
 
 _pg_engine: Optional[Engine] = None
 _ch_client: Optional[Client] = None
 
 
 def get_pg_engine() -> Engine:
+    """One pooled engine. The loop is single-threaded, so it needs one connection.
+
+    statement_timeout / lock_timeout make a blocked write fail fast instead of
+    pinning a backend behind a lock holder: the cycle rolls back, sleeps
+    ERROR_SLEEP_SEC and retries the same window, so nothing is lost. The
+    watermark only advances after a successful commit.
+    """
     global _pg_engine
     if _pg_engine is None:
         _pg_engine = create_engine(
             DATABASE_URL,
-            pool_size=5,
-            max_overflow=5,
+            pool_size=2,
+            max_overflow=2,
             pool_timeout=30,
             pool_pre_ping=True,
             pool_recycle=1800,
+            connect_args={
+                "application_name": "aisposition_b",
+                "options": (
+                    f"-c statement_timeout={PG_STATEMENT_TIMEOUT_MS}"
+                    f" -c lock_timeout={PG_LOCK_TIMEOUT_MS}"
+                ),
+            },
         )
     return _pg_engine
 
 
-def get_ch_client(force_new: bool = False) -> Client:
-    """Reuse one ClickHouse client. The old code built one per loop and never closed it."""
+def drop_ch_client() -> None:
+    """Close and forget the client so the next cycle reconnects from scratch.
+
+    Deliberately does not reconnect here. Rebuilding while ClickHouse is still
+    down raises a connection error from inside the failure handler, which buries
+    the original error and the traceback with it. Reconnecting lazily on the
+    next cycle keeps the retry on the one path that already backs off.
+    """
     global _ch_client
-    if force_new and _ch_client is not None:
+    if _ch_client is not None:
         try:
             _ch_client.close()
         except Exception:
             pass
-        _ch_client = None
+    _ch_client = None
+
+
+def get_ch_client() -> Client:
+    """Reuse one ClickHouse client. The old code built one per loop and never closed it.
+
+    CH_SEND_RECEIVE_TIMEOUT_SEC bounds how long a cycle can sit on a ClickHouse
+    that accepted the connection but stopped answering. It has to be comfortably
+    longer than a catch-up window query, and short enough that a hung server
+    does not freeze a 2-second loop for minutes.
+    """
+    global _ch_client
     if _ch_client is None:
         _ch_client = clickhouse_connect.get_client(
             host=CH_HOST,
             port=CH_PORT,
             username=CH_USER,
             password=CH_PSWD,
-            connect_timeout=15,
-            send_receive_timeout=300,
+            connect_timeout=CH_CONNECT_TIMEOUT_SEC,
+            send_receive_timeout=CH_SEND_RECEIVE_TIMEOUT_SEC,
         )
     return _ch_client
 
@@ -318,7 +409,7 @@ def fetch_positions(watermark: Optional[datetime], catching_up: bool) -> list[tu
         result = get_ch_client().query(query)
     except Exception:
         logging.exception("ClickHouse query failed, reconnecting on next cycle")
-        get_ch_client(force_new=True)
+        drop_ch_client()
         raise
 
     columns = list(result.column_names)
@@ -355,28 +446,79 @@ def fetch_positions(watermark: Optional[datetime], catching_up: bool) -> list[tu
     return list(latest.values())
 
 
+def load_existing_mmsis(mmsis: Sequence[int]) -> set[int]:
+    """Which of these MMSIs already have a row in public.ais_positionb."""
+    if not mmsis:
+        return set()
+
+    connection = get_pg_engine().raw_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(EXISTING_MMSI_SQL, (list(mmsis),))
+            found = {int(row[0]) for row in cursor.fetchall()}
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return found
+
+
+def split_rows(
+    rows: Sequence[tuple], existing: set[int]
+) -> tuple[list[tuple], list[tuple]]:
+    """(to_update, to_insert). A row goes to INSERT only when its MMSI is new."""
+    to_update: list[tuple] = []
+    to_insert: list[tuple] = []
+    for row in rows:
+        if int(row[1]) in existing:
+            to_update.append(row)
+        else:
+            to_insert.append(row)
+    return to_update, to_insert
+
+
 def _chunks(rows: Sequence[tuple], size: int) -> Iterator[Sequence[tuple]]:
     for start in range(0, len(rows), size):
         yield rows[start : start + size]
 
 
-def upsert_positions(rows: Sequence[tuple]) -> tuple[int, int]:
-    """Returns (updated, inserted). Raises on failure so the caller can back off."""
-    if not rows:
+def upsert_positions(
+    update_rows: Sequence[tuple],
+    insert_rows: Sequence[tuple] = (),
+    health_count: Optional[int] = None,
+) -> tuple[int, int]:
+    """Returns (changed, inserted). Raises on failure so the caller can back off.
+
+    changed counts rows Postgres actually wrote; rows already holding the same
+    values are filtered by the IS DISTINCT FROM guard and cost nothing but a
+    comparison. The heartbeat row rides in the same transaction, so a cycle
+    commits once instead of three times.
+    """
+    if not update_rows and not insert_rows and health_count is None:
         return 0, 0
 
-    updated = 0
+    changed = 0
     inserted = 0
 
     connection = get_pg_engine().raw_connection()
     try:
         with connection.cursor() as cursor:
-            for chunk in _chunks(rows, CHUNK_SIZE):
+            for chunk in _chunks(update_rows, CHUNK_SIZE):
                 execute_values(cursor, UPDATE_SQL, chunk, page_size=len(chunk))
-                updated += cursor.rowcount if cursor.rowcount > 0 else 0
+                changed += cursor.rowcount if cursor.rowcount > 0 else 0
 
+            # WHERE NOT EXISTS stays as a safety net, but it now runs over the
+            # few genuinely new MMSIs instead of the whole batch every cycle.
+            for chunk in _chunks(insert_rows, CHUNK_SIZE):
                 execute_values(cursor, INSERT_SQL, chunk, page_size=len(chunk))
                 inserted += cursor.rowcount if cursor.rowcount > 0 else 0
+
+            if health_count is not None:
+                cursor.execute(
+                    HEALTH_INSERT_SQL, (_utcnow_naive(), MSG_TYPE, health_count)
+                )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -384,7 +526,7 @@ def upsert_positions(rows: Sequence[tuple]) -> tuple[int, int]:
     finally:
         connection.close()
 
-    return updated, inserted
+    return changed, inserted
 
 
 def write_health(msg_count: int) -> None:
@@ -463,17 +605,20 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
         # Live + empty: keep the existing resume cursor if we have one.
         return watermark
 
-    updated, inserted = upsert_positions(rows)
+    existing = load_existing_mmsis([int(row[1]) for row in rows])
+    to_update, to_insert = split_rows(rows, existing)
+    # Heartbeat rides along, so the whole cycle is one commit.
+    changed, inserted = upsert_positions(to_update, to_insert, health_count=count)
     newest = max(row[0] for row in rows)
     logging.info(
-        "mode=%s rows=%s updated=%s inserted=%s watermark=%s",
+        "mode=%s rows=%s changed=%s unchanged=%s inserted=%s watermark=%s",
         mode,
         count,
-        updated,
+        changed,
+        max(0, len(to_update) - changed),
         inserted,
         newest.strftime(TS_FORMAT),
     )
-    write_health(count)
 
     # Always persist newest as the resume point (live and catch-up alike).
     return newest
@@ -496,8 +641,15 @@ def main() -> None:
     while run_flg:
         try:
             if time.monotonic() >= next_purge:
-                purge_health()
+                # Housekeeping must never stall position syncing. Schedule the
+                # next attempt before trying, so a failure waits a full
+                # interval instead of retrying every cycle and starving the
+                # sync behind it.
                 next_purge = time.monotonic() + HEALTH_PURGE_INTERVAL_HOURS * 3600
+                try:
+                    purge_health()
+                except Exception:
+                    logging.exception("Health purge failed, retrying next interval")
 
             watermark = run_cycle(watermark)
             write_watermark(watermark)
@@ -514,11 +666,7 @@ def main() -> None:
 
         time.sleep(POSITION_LOOP_SLEEP_SEC)
 
-    if _ch_client is not None:
-        try:
-            _ch_client.close()
-        except Exception:
-            pass
+    drop_ch_client()
 
 
 if __name__ == "__main__":
