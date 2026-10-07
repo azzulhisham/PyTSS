@@ -70,6 +70,19 @@ WATERMARK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vesse
 WATERMARK_FMT = "%Y-%m-%d %H:%M:%S"
 COMMIT_BATCH_SIZE = 300
 
+# The stale-open-zone sweep closes records older than 15 days whose vessel has
+# left the TSS region. Running it every cycle meant a parallel sequential scan
+# of the whole 940k-row ais_vesselinzone table every ~2s (~39 scans/minute,
+# 28 M rows/minute read back) to find a handful of rows that can only change
+# once a day. An hourly sweep is far more frequent than the 15-day threshold it
+# enforces, so detection is unchanged.
+CLEANUP_INTERVAL_MINUTES = 60
+
+# A blocked write fails fast instead of pinning a backend behind a lock holder:
+# the cycle logs the error, keeps the watermark, and retries on the next pass.
+PG_STATEMENT_TIMEOUT_MS = 60000
+PG_LOCK_TIMEOUT_MS = 5000
+
 # Rough bbox from the padded TSS region (SQL pre-filter only)
 _tss_coords = entire_tss_region["coordinates"][0]
 LON_MIN = min(c[0] for c in _tss_coords)
@@ -139,9 +152,21 @@ def get_pgEngine():
     if _engine is None:
         _engine = create_engine(
             DATABASE_URL,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=2,
+            max_overflow=2,
             pool_timeout=30,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            connect_args={
+                # Named so these connections are attributable in
+                # pg_stat_activity instead of showing up as a blank
+                # application_name alongside every other script.
+                "application_name": "vesselzone",
+                "options": (
+                    f"-c statement_timeout={PG_STATEMENT_TIMEOUT_MS}"
+                    f" -c lock_timeout={PG_LOCK_TIMEOUT_MS}"
+                ),
+            },
         )
     return _engine
 
@@ -329,15 +354,29 @@ def _prefer_existing(current_val, new_val):
     return current_val
 
 
-def _flush_mappings(session, items_to_update, items_to_insert):
-    if items_to_update:
-        session.bulk_update_mappings(Ais_VesselInZone, items_to_update)
-    if items_to_insert:
-        session.bulk_insert_mappings(Ais_VesselInZone, items_to_insert)
-    if items_to_update or items_to_insert:
-        session.commit()
-    items_to_update.clear()
-    items_to_insert.clear()
+def _chunks(rows, size):
+    for start in range(0, len(rows), size):
+        yield rows[start : start + size]
+
+
+def _write_batches(items_to_update, items_to_insert):
+    """Write the decided changes in short, self-contained transactions.
+
+    The zone decisions are made in pure Python first and only then written. The
+    previous shape kept one Session open across the whole per-vessel loop and
+    committed every 300 items, so between commits the connection sat in
+    'idle in transaction' while Python worked. Any such session older than 60s
+    is enough on its own to put /tss/health/postgres into 'degraded'.
+    """
+    engine = get_pgEngine()
+    for chunk in _chunks(items_to_update, COMMIT_BATCH_SIZE):
+        with Session(engine) as session:
+            session.bulk_update_mappings(Ais_VesselInZone, chunk)
+            session.commit()
+    for chunk in _chunks(items_to_insert, COMMIT_BATCH_SIZE):
+        with Session(engine) as session:
+            session.bulk_insert_mappings(Ais_VesselInZone, chunk)
+            session.commit()
 
 
 def upsert_ais_position(data):
@@ -347,15 +386,23 @@ def upsert_ais_position(data):
         logging.info("No new vessel positions to process")
         return None
 
+    # Only the MMSIs in this batch are ever looked up below, both for ENTER/STAY
+    # (open_by_key) and for EXIT (open_by_mmsi). Loading every open record in the
+    # table meant reading ~4,300 rows per cycle to use ~200 of them, and without
+    # a predicate on mmsi it was a sequential scan of all 940k rows. The
+    # tsDetected DESC order is kept: the dedupe below keeps the first row seen
+    # per (mmsi, zone), which must stay the most recently detected one.
+    batch_mmsis = sorted({int(i["mmsi"]) for i in data})
     query = text("""
         SELECT *
         FROM public.ais_vesselinzone
         WHERE "tsOut" IS NULL
+          AND mmsi IN :mmsis
         ORDER BY "tsDetected" DESC
-    """)
+    """).bindparams(bindparam("mmsis", expanding=True))
 
     try:
-        df = pd.read_sql(query, con=get_pgEngine())
+        df = pd.read_sql(query, con=get_pgEngine(), params={"mmsis": batch_mmsis})
         current_vessels_zone = df.to_dict(orient="records")
         del df
         gc.collect()
@@ -388,93 +435,90 @@ def upsert_ais_position(data):
     max_ts = None
     now = datetime.now()
 
-    with Session(get_pgEngine()) as session:
-        for i in data:
-            mmsi = int(i["mmsi"])
-            vessel_ts = to_naive_datetime(i["ts"])
-            if vessel_ts is not None and (max_ts is None or vessel_ts > max_ts):
-                max_ts = vessel_ts
+    for i in data:
+        mmsi = int(i["mmsi"])
+        vessel_ts = to_naive_datetime(i["ts"])
+        if vessel_ts is not None and (max_ts is None or vessel_ts > max_ts):
+            max_ts = vessel_ts
 
-            zones_inside = vessels_in_zones.get(mmsi, set())
+        zones_inside = vessels_in_zones.get(mmsi, set())
 
-            # ENTER / STAY
-            for idx in zones_inside:
-                existing_vessel_zone = open_by_key.get((mmsi, idx))
+        # ENTER / STAY
+        for idx in zones_inside:
+            existing_vessel_zone = open_by_key.get((mmsi, idx))
 
-                if existing_vessel_zone:
-                    if pd.isnull(existing_vessel_zone.get("tsOut")):
-                        ts_detected = to_naive_datetime(existing_vessel_zone["tsDetected"])
-                        if (
-                            ts_detected is not None
-                            and now - ts_detected > timedelta(days=15)
-                            and existing_vessel_zone["zone"] <= 11
-                        ):
-                            existing_vessel_zone["tsOut"] = now
-                        else:
-                            existing_vessel_zone["tsOut"] = None
+            if existing_vessel_zone:
+                if pd.isnull(existing_vessel_zone.get("tsOut")):
+                    ts_detected = to_naive_datetime(existing_vessel_zone["tsDetected"])
+                    if (
+                        ts_detected is not None
+                        and now - ts_detected > timedelta(days=15)
+                        and existing_vessel_zone["zone"] <= 11
+                    ):
+                        existing_vessel_zone["tsOut"] = now
+                    else:
+                        existing_vessel_zone["tsOut"] = None
 
-                    payload = clean_record(existing_vessel_zone.copy())
-                    payload["curlongitude"] = i["longitude"]
-                    payload["curlatitude"] = i["latitude"]
-                    payload["tsCurrent"] = vessel_ts
-                    payload["destination"] = _prefer_existing(payload.get("destination"), i.get("destination"))
-                    payload["sog"] = _prefer_existing(payload.get("sog"), i.get("sog"))
-                    payload["cog"] = _prefer_existing(payload.get("cog"), i.get("cog"))
-                    payload["rot"] = _prefer_existing(payload.get("rot"), i.get("rot"))
-                    payload["trueHeading"] = _prefer_existing(payload.get("trueHeading"), i.get("trueHeading"))
-
-                    items_to_update.append(payload)
-                    update_count += 1
-                else:
-                    new_vessel_zone = {
-                        "tsDetected": vessel_ts,
-                        "mmsi": mmsi,
-                        "navStatus": i["navStatus"],
-                        "navStatusDesc": i["navStatusDesc"],
-                        "longitude": i["longitude"],
-                        "latitude": i["latitude"],
-                        "tsCurrent": vessel_ts,
-                        "tsOut": None,
-                        "zone": idx,
-                        "imo": i["imo"],
-                        "shipType": i["shipType"],
-                        "shipTypeDesc": i["shipTypeDesc"],
-                        "shipName": i["shipName"],
-                        "callsign": i["callsign"],
-                        "destination": i["destination"],
-                        "draught": i["draught"],
-                        "to_bow": i["to_bow"],
-                        "to_stern": i["to_stern"],
-                        "to_port": i["to_port"],
-                        "to_starboard": i["to_starboard"],
-                        "curlongitude": i["longitude"],
-                        "curlatitude": i["latitude"],
-                        "sog": i["sog"],
-                        "cog": i["cog"],
-                        "rot": i["rot"],
-                        "trueHeading": i["trueHeading"],
-                    }
-                    items_to_insert.append(clean_record(new_vessel_zone))
-                    insert_count += 1
-
-            # EXIT: open zones for this ship that are no longer matched
-            for existing_vessel_zone in open_by_mmsi.get(mmsi, []):
-                zone_id = int(existing_vessel_zone["zone"])
-                if zone_id in zones_inside:
-                    continue
-                if not pd.isnull(existing_vessel_zone.get("tsOut")):
-                    continue
-
-                existing_vessel_zone["tsOut"] = vessel_ts
                 payload = clean_record(existing_vessel_zone.copy())
+                payload["curlongitude"] = i["longitude"]
+                payload["curlatitude"] = i["latitude"]
+                payload["tsCurrent"] = vessel_ts
+                payload["destination"] = _prefer_existing(payload.get("destination"), i.get("destination"))
+                payload["sog"] = _prefer_existing(payload.get("sog"), i.get("sog"))
+                payload["cog"] = _prefer_existing(payload.get("cog"), i.get("cog"))
+                payload["rot"] = _prefer_existing(payload.get("rot"), i.get("rot"))
+                payload["trueHeading"] = _prefer_existing(payload.get("trueHeading"), i.get("trueHeading"))
+
                 items_to_update.append(payload)
-                exit_count += 1
+                update_count += 1
+            else:
+                new_vessel_zone = {
+                    "tsDetected": vessel_ts,
+                    "mmsi": mmsi,
+                    "navStatus": i["navStatus"],
+                    "navStatusDesc": i["navStatusDesc"],
+                    "longitude": i["longitude"],
+                    "latitude": i["latitude"],
+                    "tsCurrent": vessel_ts,
+                    "tsOut": None,
+                    "zone": idx,
+                    "imo": i["imo"],
+                    "shipType": i["shipType"],
+                    "shipTypeDesc": i["shipTypeDesc"],
+                    "shipName": i["shipName"],
+                    "callsign": i["callsign"],
+                    "destination": i["destination"],
+                    "draught": i["draught"],
+                    "to_bow": i["to_bow"],
+                    "to_stern": i["to_stern"],
+                    "to_port": i["to_port"],
+                    "to_starboard": i["to_starboard"],
+                    "curlongitude": i["longitude"],
+                    "curlatitude": i["latitude"],
+                    "sog": i["sog"],
+                    "cog": i["cog"],
+                    "rot": i["rot"],
+                    "trueHeading": i["trueHeading"],
+                }
+                items_to_insert.append(clean_record(new_vessel_zone))
+                insert_count += 1
 
-            if len(items_to_update) + len(items_to_insert) >= COMMIT_BATCH_SIZE:
-                _flush_mappings(session, items_to_update, items_to_insert)
-                logging.info("Partial commit done....")
+        # EXIT: open zones for this ship that are no longer matched
+        for existing_vessel_zone in open_by_mmsi.get(mmsi, []):
+            zone_id = int(existing_vessel_zone["zone"])
+            if zone_id in zones_inside:
+                continue
+            if not pd.isnull(existing_vessel_zone.get("tsOut")):
+                continue
 
-        _flush_mappings(session, items_to_update, items_to_insert)
+            existing_vessel_zone["tsOut"] = vessel_ts
+            payload = clean_record(existing_vessel_zone.copy())
+            items_to_update.append(payload)
+            exit_count += 1
+
+    # All zone decisions are made above with no transaction open; only now do we
+    # write, in short batched transactions.
+    _write_batches(items_to_update, items_to_insert)
 
     logging.info(
         f"Upserting data done :: insert={insert_count}, update={update_count}, exit={exit_count}"
@@ -555,7 +599,12 @@ if __name__ == "__main__":
     logging.info("[START] vesselzone service starting")
     create_db_and_tables()
     init_spatial_tables()
-    logging.info("[START] ready :: watermark=%s", WATERMARK_PATH)
+    # Sweep once on startup, then only every CLEANUP_INTERVAL_MINUTES.
+    next_cleanup = 0.0
+    logging.info(
+        "[START] ready :: watermark=%s, cleanup every %s min",
+        WATERMARK_PATH, CLEANUP_INTERVAL_MINUTES,
+    )
 
     while runFlg:
         cycle_no += 1
@@ -597,10 +646,13 @@ if __name__ == "__main__":
             gc.collect()
 
             stage = "cleanup"
-            logging.info("[CYCLE %s] stage=cleanup :: stale open-zone check", cycle_no)
-            t0 = time.perf_counter()
-            chk_invalid_data()
-            t_cleanup = time.perf_counter() - t0
+            t_cleanup = 0.0
+            if time.monotonic() >= next_cleanup:
+                next_cleanup = time.monotonic() + CLEANUP_INTERVAL_MINUTES * 60
+                logging.info("[CYCLE %s] stage=cleanup :: stale open-zone check", cycle_no)
+                t0 = time.perf_counter()
+                chk_invalid_data()
+                t_cleanup = time.perf_counter() - t0
 
             t_total = time.perf_counter() - t_cycle
             logging.info(
