@@ -783,7 +783,7 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     changed, inserted = upsert_positions(
         to_update, to_insert, rewind, health_count=count
     )
-    newest = max(row[I_TS] for row in rows)
+    newest = max(_as_naive_ts(row[I_TS]) for row in rows)
     logging.info(
         "mode=%s rows=%s changed=%s unchanged=%s inserted=%s itu=%s "
         "pg_skip=%s pg_rewind=%s watermark=%s",
@@ -797,6 +797,21 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
         len(rewind),
         newest.strftime(TS_FORMAT),
     )
+
+    # Catch-up must advance past ClickHouse gaps. An empty window already steps
+    # by WINDOW_SECONDS; a window that only returns rows at/before the watermark
+    # (e.g. a single boundary row) must do the same or the cursor freezes and
+    # /tss/health/datacount stays at msgCnt=1 forever.
+    if catching_up and watermark is not None and newest <= watermark:
+        advanced = watermark + timedelta(seconds=WINDOW_SECONDS)
+        logging.warning(
+            "Catch-up window produced no newer ts (newest=%s watermark=%s); "
+            "advancing to %s to skip gap",
+            newest.strftime(TS_FORMAT),
+            watermark.strftime(TS_FORMAT),
+            advanced.strftime(TS_FORMAT),
+        )
+        return advanced
 
     # Always persist newest as the resume point (live and catch-up alike).
     return newest

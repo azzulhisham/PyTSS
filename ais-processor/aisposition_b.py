@@ -609,7 +609,10 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     to_update, to_insert = split_rows(rows, existing)
     # Heartbeat rides along, so the whole cycle is one commit.
     changed, inserted = upsert_positions(to_update, to_insert, health_count=count)
-    newest = max(row[0] for row in rows)
+    newest = max(
+        (row[0].replace(tzinfo=None) if getattr(row[0], "tzinfo", None) else row[0])
+        for row in rows
+    )
     logging.info(
         "mode=%s rows=%s changed=%s unchanged=%s inserted=%s watermark=%s",
         mode,
@@ -619,6 +622,20 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
         inserted,
         newest.strftime(TS_FORMAT),
     )
+
+    # Catch-up must advance past ClickHouse gaps. An empty window already steps
+    # by WINDOW_SECONDS; a window that only returns rows at/before the watermark
+    # must do the same or the cursor freezes forever.
+    if catching_up and watermark is not None and newest <= watermark:
+        advanced = watermark + timedelta(seconds=WINDOW_SECONDS)
+        logging.warning(
+            "Catch-up window produced no newer ts (newest=%s watermark=%s); "
+            "advancing to %s to skip gap",
+            newest.strftime(TS_FORMAT),
+            watermark.strftime(TS_FORMAT),
+            advanced.strftime(TS_FORMAT),
+        )
+        return advanced
 
     # Always persist newest as the resume point (live and catch-up alike).
     return newest
