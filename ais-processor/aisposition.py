@@ -14,6 +14,12 @@ version for an identical write. Which MMSIs exist is already known from the
 last-known read, so the INSERT only sees genuinely new ones, and the heartbeat
 row shares the write transaction: one commit per cycle.
 
+COG 360 and SOG 102.2 mean "not available". Those rows are kept: the columns
+are NOT NULL, so the sentinel number is stored and the position still updates.
+A row is dropped only when latitude or longitude is missing or out of range.
+A ship that has not moved (~10 m), has the same nav status, and is slower than
+0.5 kn is written from this process's memory at most once per 120 s.
+
 Every setting has a default in _DEFAULTS below, so the script runs with no .env
 file and no environment variables. Anything set in the environment wins.
 
@@ -45,6 +51,11 @@ from urllib.parse import quote
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
+from position_gate import (
+    apply_stationary_throttle,
+    prepare_position,
+    remember_written,
+)
 from psycopg2.extras import execute_values
 from sqlmodel import Field, SQLModel, create_engine
 from sqlalchemy.engine import Engine
@@ -86,6 +97,11 @@ _DEFAULTS = {
     "PG_LOCK_TIMEOUT_MS": "5000",
     "CH_CONNECT_TIMEOUT_SEC": "15",
     "CH_SEND_RECEIVE_TIMEOUT_SEC": "60",
+    # Stationary ships: write again only after this many seconds, and only
+    # when the new fix is farther than this many metres or speed/status changed.
+    "STATIONARY_REFRESH_SEC": "120",
+    "STATIONARY_MOVE_M": "10",
+    "STATIONARY_SOG_KN": "0.5",
 }
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -110,9 +126,8 @@ I_LAT = 5
 I_COG = 7
 I_SOG = 8
 
-# AIS Type 1/2/3 sentinels (ITU-R M.1371). Heading 511 = N/A is kept on the row.
-SOG_NA_KNOTS = 102.2
-COG_NA_DEG = 360.0
+# trueHeading 511 = not available and stays on the row. Course and speed
+# sentinels are handled in position_gate (the columns are NOT NULL).
 EARTH_RADIUS_KM = 6371.0
 NM_PER_KM = 1.0 / 1.852
 
@@ -201,6 +216,13 @@ PG_STATEMENT_TIMEOUT_MS = _cfg_int("PG_STATEMENT_TIMEOUT_MS")
 PG_LOCK_TIMEOUT_MS = _cfg_int("PG_LOCK_TIMEOUT_MS")
 CH_CONNECT_TIMEOUT_SEC = _cfg_int("CH_CONNECT_TIMEOUT_SEC")
 CH_SEND_RECEIVE_TIMEOUT_SEC = _cfg_int("CH_SEND_RECEIVE_TIMEOUT_SEC")
+STATIONARY_REFRESH_SEC = _cfg_float("STATIONARY_REFRESH_SEC")
+STATIONARY_MOVE_M = _cfg_float("STATIONARY_MOVE_M")
+STATIONARY_SOG_KN = _cfg_float("STATIONARY_SOG_KN")
+
+# Last row this process wrote, keyed by MMSI. Empty after a restart, so the
+# first report is written. Later stationary repeats wait out the interval.
+_last_written: dict[int, tuple] = {}
 
 
 _SET_SQL = """\
@@ -429,18 +451,6 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2.0 * EARTH_RADIUS_KM * math.asin(math.sqrt(min(1.0, a)))
 
 
-def _is_itu_sentinel(lon: float, lat: float, cog: float, sog: float) -> bool:
-    if lon < -180.0 or lon > 180.0:
-        return True
-    if lat < -90.0 or lat > 90.0:
-        return True
-    if sog >= SOG_NA_KNOTS:
-        return True
-    if cog >= COG_NA_DEG:
-        return True
-    return False
-
-
 def _as_naive_ts(ts: datetime) -> datetime:
     if getattr(ts, "tzinfo", None) is not None:
         return ts.replace(tzinfo=None)
@@ -512,10 +522,11 @@ def build_query(watermark: Optional[datetime], catching_up: bool) -> str:
 
 def fetch_positions(
     watermark: Optional[datetime], catching_up: bool
-) -> tuple[list[tuple], dict[int, bool], int, int]:
+) -> tuple[list[tuple], dict[int, bool], int, int, int]:
     """Latest kinematically consistent row per MMSI.
 
-    Returns (picks, corroborated_by_mmsi, skipped_null, skipped_itu).
+    Returns (picks, corroborated, skipped_null, skipped_invalid, field_sentinel).
+    A row is invalid only when its position is missing or out of range.
     """
     query = build_query(watermark, catching_up)
     logging.debug("ClickHouse query: %s", query)
@@ -532,25 +543,26 @@ def fetch_positions(
 
     by_mmsi: dict[int, list[tuple]] = {}
     skipped_null = 0
-    skipped_itu = 0
+    skipped_invalid = 0
+    field_sentinel = 0
     for raw in result.result_rows:
         values = tuple(raw[index[name]] for name in ROW_FIELDS)
-        if any(value is None for value in values):
+        if values[I_TS] is None or values[I_MMSI] is None:
             skipped_null += 1
             continue
-        try:
-            lon = _as_float(values[I_LON])
-            lat = _as_float(values[I_LAT])
-            cog = _as_float(values[I_COG])
-            sog = _as_float(values[I_SOG])
-        except (TypeError, ValueError):
-            skipped_itu += 1
+        row, invalid, sentinel = prepare_position(values)
+        if invalid or row is None:
+            skipped_invalid += 1
             continue
-        if _is_itu_sentinel(lon, lat, cog, sog):
-            skipped_itu += 1
+        # nav status, description, rot, and true heading are NOT NULL and are
+        # not course/speed sentinels. A missing one cannot be written.
+        if row[2] is None or row[3] is None or row[6] is None or row[9] is None:
+            skipped_null += 1
             continue
-        mmsi = int(values[I_MMSI])
-        by_mmsi.setdefault(mmsi, []).append(values)
+        if sentinel:
+            field_sentinel += 1
+        mmsi = int(row[I_MMSI])
+        by_mmsi.setdefault(mmsi, []).append(row)
 
     picks: list[tuple] = []
     corroborated: dict[int, bool] = {}
@@ -565,15 +577,16 @@ def fetch_positions(
 
     if skipped_null:
         logging.warning("Skipped %s ClickHouse rows containing NULLs", skipped_null)
-    if skipped_itu or skipped_ch:
+    if skipped_invalid or field_sentinel or skipped_ch:
         logging.info(
-            "position noise: itu=%s ch_newer_teleport=%s mmsi=%s",
-            skipped_itu,
+            "position noise: invalid=%s field_sentinel=%s ch_newer_teleport=%s mmsi=%s",
+            skipped_invalid,
+            field_sentinel,
             skipped_ch,
             len(picks),
         )
 
-    return picks, corroborated, skipped_null, skipped_itu
+    return picks, corroborated, skipped_null, skipped_invalid, field_sentinel
 
 
 def load_existing_positions(mmsis: Sequence[int]) -> dict[int, tuple]:
@@ -755,7 +768,9 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     catching_up = is_catching_up(watermark, now)
     mode = "catch-up" if catching_up else "live"
 
-    rows, corroborated, _skipped_null, skipped_itu = fetch_positions(watermark, catching_up)
+    rows, corroborated, _skipped_null, skipped_invalid, field_sentinel = fetch_positions(
+        watermark, catching_up
+    )
     count = len(rows)
 
     if count < LIVE_MODE_THRESHOLD:
@@ -779,20 +794,30 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     to_update, to_insert, rewind, skipped_pg = apply_pg_kinematic_gate(
         rows, corroborated, existing
     )
+    to_update, stationary_throttled = apply_stationary_throttle(
+        to_update,
+        _last_written,
+        move_m=STATIONARY_MOVE_M,
+        refresh_s=STATIONARY_REFRESH_SEC,
+        sog_kn=STATIONARY_SOG_KN,
+    )
     # Heartbeat rides along, so the whole cycle is one commit.
     changed, inserted = upsert_positions(
         to_update, to_insert, rewind, health_count=count
     )
+    remember_written(_last_written, [*to_update, *to_insert, *rewind])
     newest = max(_as_naive_ts(row[I_TS]) for row in rows)
     logging.info(
-        "mode=%s rows=%s changed=%s unchanged=%s inserted=%s itu=%s "
-        "pg_skip=%s pg_rewind=%s watermark=%s",
+        "mode=%s rows=%s changed=%s unchanged=%s inserted=%s invalid=%s "
+        "field_sentinel=%s stationary_throttled=%s pg_skip=%s pg_rewind=%s watermark=%s",
         mode,
         count,
         changed,
         max(0, len(to_update) + len(rewind) - changed),
         inserted,
-        skipped_itu,
+        skipped_invalid,
+        field_sentinel,
+        stationary_throttled,
         skipped_pg,
         len(rewind),
         newest.strftime(TS_FORMAT),

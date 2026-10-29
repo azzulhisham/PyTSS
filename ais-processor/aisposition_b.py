@@ -10,11 +10,11 @@ instead of a query per row:
 A vessel stays in the live lookback window for many cycles, so the same fix is
 re-picked repeatedly. The UPDATE compares every data column and writes only
 when something actually differs, because Postgres otherwise creates a new row
-version for an identical write. ts is part of that comparison, so a stationary
-vessel reporting the same position with a fresh timestamp is still written; only
-an exact duplicate of the stored message is skipped. The MMSIs already present
-are read once per cycle, so the INSERT only sees genuinely new ones, and the
-heartbeat row shares the write transaction: one commit per cycle.
+version for an identical write. A ship that has not moved (~10 m), has the
+same nav status, and is slower than 0.5 kn is written from this process's
+memory at most once per 120 s. The MMSIs already present are read once per
+cycle, so the INSERT only sees genuinely new ones, and the heartbeat row
+shares the write transaction: one commit per cycle.
 
 Every setting has a default in _DEFAULTS below, so the script runs with no .env
 file and no environment variables. Anything set in the environment wins.
@@ -45,6 +45,11 @@ from urllib.parse import quote
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
+from position_gate import (
+    apply_stationary_throttle,
+    prepare_position,
+    remember_written,
+)
 from psycopg2.extras import execute_values
 from sqlmodel import Field, SQLModel, create_engine
 from sqlalchemy.engine import Engine
@@ -88,6 +93,9 @@ _DEFAULTS = {
     "PG_LOCK_TIMEOUT_MS": "5000",
     "CH_CONNECT_TIMEOUT_SEC": "15",
     "CH_SEND_RECEIVE_TIMEOUT_SEC": "60",
+    "STATIONARY_REFRESH_SEC": "120",
+    "STATIONARY_MOVE_M": "10",
+    "STATIONARY_SOG_KN": "0.5",
 }
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -142,6 +150,14 @@ def _cfg_int(name: str) -> int:
         return int(_DEFAULTS[name])
 
 
+def _cfg_float(name: str) -> float:
+    try:
+        return float(_cfg(name))
+    except ValueError:
+        logging.warning("Invalid float for %s, using default %s", name, _DEFAULTS[name])
+        return float(_DEFAULTS[name])
+
+
 _load_dotenv(SCRIPT_DIR / ".env")
 
 DATABASE_URL = (
@@ -169,6 +185,11 @@ PG_STATEMENT_TIMEOUT_MS = _cfg_int("PG_STATEMENT_TIMEOUT_MS")
 PG_LOCK_TIMEOUT_MS = _cfg_int("PG_LOCK_TIMEOUT_MS")
 CH_CONNECT_TIMEOUT_SEC = _cfg_int("CH_CONNECT_TIMEOUT_SEC")
 CH_SEND_RECEIVE_TIMEOUT_SEC = _cfg_int("CH_SEND_RECEIVE_TIMEOUT_SEC")
+STATIONARY_REFRESH_SEC = _cfg_float("STATIONARY_REFRESH_SEC")
+STATIONARY_MOVE_M = _cfg_float("STATIONARY_MOVE_M")
+STATIONARY_SOG_KN = _cfg_float("STATIONARY_SOG_KN")
+
+_last_written: dict[int, tuple] = {}
 
 
 _SET_SQL = """\
@@ -400,8 +421,16 @@ def build_query(watermark: Optional[datetime], catching_up: bool) -> str:
     """
 
 
-def fetch_positions(watermark: Optional[datetime], catching_up: bool) -> list[tuple]:
-    """Return rows shaped for the SQL VALUES clause, deduplicated on mmsi."""
+def fetch_positions(
+    watermark: Optional[datetime], catching_up: bool
+) -> tuple[list[tuple], int, int, int]:
+    """Return rows shaped for the SQL VALUES clause, deduplicated on mmsi.
+
+    Returns (rows, skipped_null, skipped_invalid, field_sentinel).
+    Class B does not drop COG 360. A row is dropped only when its position
+    is missing or out of range. A missing course or speed is stored as the
+    not-available number because those columns are NOT NULL.
+    """
     query = build_query(watermark, catching_up)
     logging.debug("ClickHouse query: %s", query)
 
@@ -416,17 +445,18 @@ def fetch_positions(watermark: Optional[datetime], catching_up: bool) -> list[tu
     index = {name: columns.index(name) for name in CH_FIELDS}
 
     latest: dict[int, tuple] = {}
-    skipped = 0
+    skipped_null = 0
+    skipped_invalid = 0
+    field_sentinel = 0
     for raw in result.result_rows:
         source = {name: raw[index[name]] for name in CH_FIELDS}
-        if any(value is None for value in source.values()):
-            skipped += 1
+        if source["ts"] is None or source["mmsi"] is None or source["trueHeading"] is None:
+            skipped_null += 1
             continue
 
-        mmsi = int(source["mmsi"])
         values = (
             source["ts"],
-            mmsi,
+            int(source["mmsi"]),
             DEFAULT_NAV_STATUS,
             DEFAULT_NAV_STATUS_DESC,
             source["longitude"],
@@ -436,14 +466,28 @@ def fetch_positions(watermark: Optional[datetime], catching_up: bool) -> list[tu
             source["sog"],
             source["trueHeading"],
         )
+        row, invalid, sentinel = prepare_position(values)
+        if invalid or row is None:
+            skipped_invalid += 1
+            continue
+        if sentinel:
+            field_sentinel += 1
+        mmsi = int(row[1])
         previous = latest.get(mmsi)
-        if previous is None or values[0] > previous[0]:
-            latest[mmsi] = values
+        if previous is None or row[0] > previous[0]:
+            latest[mmsi] = row
 
-    if skipped:
-        logging.warning("Skipped %s ClickHouse rows containing NULLs", skipped)
+    if skipped_null:
+        logging.warning("Skipped %s ClickHouse rows containing NULLs", skipped_null)
+    if skipped_invalid or field_sentinel:
+        logging.info(
+            "position noise: invalid=%s field_sentinel=%s mmsi=%s",
+            skipped_invalid,
+            field_sentinel,
+            len(latest),
+        )
 
-    return list(latest.values())
+    return list(latest.values()), skipped_null, skipped_invalid, field_sentinel
 
 
 def load_existing_mmsis(mmsis: Sequence[int]) -> set[int]:
@@ -585,7 +629,9 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     catching_up = is_catching_up(watermark, now)
     mode = "catch-up" if catching_up else "live"
 
-    rows = fetch_positions(watermark, catching_up)
+    rows, _skipped_null, skipped_invalid, field_sentinel = fetch_positions(
+        watermark, catching_up
+    )
     count = len(rows)
 
     if count < LIVE_MODE_THRESHOLD:
@@ -607,19 +653,31 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
 
     existing = load_existing_mmsis([int(row[1]) for row in rows])
     to_update, to_insert = split_rows(rows, existing)
+    to_update, stationary_throttled = apply_stationary_throttle(
+        to_update,
+        _last_written,
+        move_m=STATIONARY_MOVE_M,
+        refresh_s=STATIONARY_REFRESH_SEC,
+        sog_kn=STATIONARY_SOG_KN,
+    )
     # Heartbeat rides along, so the whole cycle is one commit.
     changed, inserted = upsert_positions(to_update, to_insert, health_count=count)
+    remember_written(_last_written, [*to_update, *to_insert])
     newest = max(
         (row[0].replace(tzinfo=None) if getattr(row[0], "tzinfo", None) else row[0])
         for row in rows
     )
     logging.info(
-        "mode=%s rows=%s changed=%s unchanged=%s inserted=%s watermark=%s",
+        "mode=%s rows=%s changed=%s unchanged=%s inserted=%s invalid=%s "
+        "field_sentinel=%s stationary_throttled=%s watermark=%s",
         mode,
         count,
         changed,
         max(0, len(to_update) - changed),
         inserted,
+        skipped_invalid,
+        field_sentinel,
+        stationary_throttled,
         newest.strftime(TS_FORMAT),
     )
 
