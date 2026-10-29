@@ -150,5 +150,6 @@ When approved:
 | Commit | Subject |
 |---|---|
 | `5c5685c6997f438ee0986a3ba62934e5dd15777e` | Keep AIS position reports when course or speed is not available. |
+| `f6c921d401d8f14b644f9e35862be9f18e18f8ac` | Record the AIS position-sentinel report. |
 
 Not pushed. The parent on main was `2c95cf5`.
