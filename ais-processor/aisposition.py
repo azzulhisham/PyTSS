@@ -398,27 +398,81 @@ def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(get_pg_engine())
 
 
-def read_watermark() -> Optional[datetime]:
-    """Missing file, empty file and unparseable content all mean 'no watermark'."""
+def _watermark_bak_path() -> Path:
+    return Path(f"{WATERMARK_PATH}.bak")
+
+
+def _watermark_tmp_path() -> Path:
+    return Path(f"{WATERMARK_PATH}.tmp")
+
+
+def _parse_watermark_text(raw: str, source: Path) -> Optional[datetime]:
+    text = raw.strip()
+    if not text:
+        return None
     try:
-        raw = WATERMARK_PATH.read_text(encoding="utf-8").strip()
+        return datetime.strptime(text, TS_FORMAT)
+    except ValueError:
+        logging.warning("Ignoring unparseable watermark %r in %s", text, source)
+        return None
+
+
+def _read_watermark_file(path: Path) -> Optional[datetime]:
+    try:
+        raw = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(raw, TS_FORMAT)
-    except ValueError:
-        logging.warning("Ignoring unparseable watermark %r in %s", raw, WATERMARK_PATH)
-        return None
+    return _parse_watermark_text(raw, path)
+
+
+def read_watermark() -> Optional[datetime]:
+    """Read the resume cursor. Fall back to .bak if main is missing/empty/bad."""
+    parsed = _read_watermark_file(WATERMARK_PATH)
+    if parsed is not None:
+        return parsed
+    bak = _watermark_bak_path()
+    parsed_bak = _read_watermark_file(bak)
+    if parsed_bak is not None:
+        logging.warning(
+            "Main watermark missing/empty/unparseable at %s; using backup %s",
+            WATERMARK_PATH,
+            bak,
+        )
+        return parsed_bak
+    return None
 
 
 def write_watermark(value: Optional[datetime]) -> None:
-    text = value.strftime(TS_FORMAT) if value is not None else ""
+    """Atomically persist a non-None watermark; never replace a good file with empty."""
+    if value is None:
+        logging.debug("Skipping watermark write: value is None")
+        return
+
+    text = value.strftime(TS_FORMAT)
+    tmp = _watermark_tmp_path()
+    bak = _watermark_bak_path()
     try:
-        WATERMARK_PATH.write_text(f"{text}\n", encoding="utf-8")
+        # Keep the previous good main content as .bak before replacing.
+        if WATERMARK_PATH.is_file():
+            try:
+                existing = WATERMARK_PATH.read_text(encoding="utf-8").strip()
+                if existing:
+                    bak.write_text(f"{existing}\n", encoding="utf-8")
+            except OSError as ex:
+                logging.warning("Could not refresh watermark backup %s: %s", bak, ex)
+
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(f"{text}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, WATERMARK_PATH)
     except OSError as ex:
         logging.warning("Could not write watermark to %s: %s", WATERMARK_PATH, ex)
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _utcnow_naive() -> datetime:
@@ -843,7 +897,23 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
 
 
 def main() -> None:
-    create_db_and_tables()
+    # File-only: keep the resume point even if Postgres is unreachable at boot.
+    watermark = read_watermark()
+
+    while True:
+        try:
+            create_db_and_tables()
+            break
+        except KeyboardInterrupt:
+            logging.info("Interrupted during startup")
+            return
+        except Exception:
+            logging.exception(
+                "Startup create_db_and_tables failed; retrying in %ss",
+                ERROR_SLEEP_SEC,
+            )
+            time.sleep(ERROR_SLEEP_SEC)
+
     logging.info(
         "aisposition started (CH=%s:%s db=%s table=%s)",
         CH_HOST,
@@ -852,7 +922,6 @@ def main() -> None:
         PG_TABLE,
     )
 
-    watermark = read_watermark()
     next_purge = 0.0
     run_flg = True
 
