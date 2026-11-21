@@ -85,6 +85,11 @@ _DEFAULTS = {
     "LIVE_MODE_THRESHOLD": "700",
     "POSITION_LOOP_SLEEP_SEC": "2",
     "ERROR_SLEEP_SEC": "12",
+    # Consecutive failures, or empty catch-up cycles whose cursor did not move,
+    # before a STALL log. 0 disables the log.
+    "STALL_CYCLES": "10",
+    # Exit after this many consecutive failed cycles. 0 keeps log-sleep-continue.
+    "WATCHDOG_EXIT_FAILURES": "0",
     "CHUNK_SIZE": "2000",
     "HEALTH_RETENTION_DAYS": "30",
     "HEALTH_PURGE_INTERVAL_HOURS": "24",
@@ -204,6 +209,8 @@ LIVE_LOOKBACK_MINUTES = _cfg_int("LIVE_LOOKBACK_MINUTES")
 LIVE_MODE_THRESHOLD = _cfg_int("LIVE_MODE_THRESHOLD")
 POSITION_LOOP_SLEEP_SEC = _cfg_int("POSITION_LOOP_SLEEP_SEC")
 ERROR_SLEEP_SEC = _cfg_int("ERROR_SLEEP_SEC")
+STALL_CYCLES = _cfg_int("STALL_CYCLES")
+WATCHDOG_EXIT_FAILURES = _cfg_int("WATCHDOG_EXIT_FAILURES")
 CHUNK_SIZE = _cfg_int("CHUNK_SIZE")
 HEALTH_RETENTION_DAYS = _cfg_int("HEALTH_RETENTION_DAYS")
 HEALTH_PURGE_INTERVAL_HOURS = _cfg_int("HEALTH_PURGE_INTERVAL_HOURS")
@@ -223,6 +230,11 @@ STATIONARY_SOG_KN = _cfg_float("STATIONARY_SOG_KN")
 # Last row this process wrote, keyed by MMSI. Empty after a restart, so the
 # first report is written. Later stationary repeats wait out the interval.
 _last_written: dict[int, tuple] = {}
+
+# Separate streaks. A successful cycle clears both, except a catch-up window
+# whose cursor did not move: that increments the stuck counter only.
+_consecutive_failures = 0
+_consecutive_stuck_catchup = 0
 
 
 _SET_SQL = """\
@@ -574,6 +586,27 @@ def build_query(watermark: Optional[datetime], catching_up: bool) -> str:
     """
 
 
+def _clickhouse_result_empty(result: object) -> bool:
+    """True when a successful query has no usable rows.
+
+    An empty window can come back with no column_names. Building the column
+    index then raises ValueError ('ts' is not in list) before the cycle can
+    treat the window as zero rows.
+    """
+    if result is None:
+        return True
+    names = getattr(result, "column_names", None)
+    if not names:
+        return True
+    try:
+        columns = list(names)
+    except TypeError:
+        return True
+    if "ts" not in columns:
+        return True
+    return not getattr(result, "result_rows", None)
+
+
 def fetch_positions(
     watermark: Optional[datetime], catching_up: bool
 ) -> tuple[list[tuple], dict[int, bool], int, int, int]:
@@ -591,6 +624,9 @@ def fetch_positions(
         logging.exception("ClickHouse query failed, reconnecting on next cycle")
         drop_ch_client()
         raise
+
+    if _clickhouse_result_empty(result):
+        return [], {}, 0, 0, 0
 
     columns = list(result.column_names)
     index = {name: columns.index(name) for name in ROW_FIELDS}
@@ -809,6 +845,110 @@ def purge_health() -> int:
     return total
 
 
+def _reset_stall_counters() -> None:
+    global _consecutive_failures, _consecutive_stuck_catchup
+    _consecutive_failures = 0
+    _consecutive_stuck_catchup = 0
+
+
+def _format_stall_ts(value: Optional[datetime]) -> str:
+    if value is None:
+        return "none"
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.strftime(TS_FORMAT)
+
+
+def _ch_max_ts() -> tuple[Optional[datetime], bool]:
+    """SELECT max(ts) for a stall decision. Returns (max_ts, probe_failed).
+
+    Called only when a STALL line is about to be emitted. A failure here must
+    not escape: the cycle has already been counted.
+    """
+    try:
+        result = get_ch_client().query(f"SELECT max(ts) FROM {CH_TABLE}")
+    except Exception:
+        drop_ch_client()
+        return None, True
+    if result is None or not getattr(result, "column_names", None):
+        return None, True
+    rows = getattr(result, "result_rows", None) or ()
+    if not rows:
+        return None, True
+    value = rows[0][0]
+    if value is None:
+        return None, False
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value, False
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value[:19], TS_FORMAT), False
+        except ValueError:
+            return None, True
+    return None, True
+
+
+def _emit_stall(kind: str, count: int, mode: str, watermark: Optional[datetime]) -> None:
+    """Log STALL when a streak hits a multiple of STALL_CYCLES and CH looks live.
+
+    A stale max(ts) stays quiet: the source itself is behind. A probe error
+    still logs, and says the freshness check failed.
+    """
+    if STALL_CYCLES <= 0 or count < STALL_CYCLES or count % STALL_CYCLES != 0:
+        return
+    max_ts, failed = _ch_max_ts()
+    wm = _format_stall_ts(watermark)
+    if failed:
+        logging.warning(
+            "STALL kind=%s mode=%s count=%s watermark=%s freshness=check_failed",
+            kind,
+            mode,
+            count,
+            wm,
+        )
+        return
+    now = _utcnow_naive()
+    recent = (
+        max_ts is not None
+        and max_ts >= now - timedelta(minutes=LIVE_LOOKBACK_MINUTES)
+    )
+    if not recent:
+        return
+    logging.warning(
+        "STALL kind=%s mode=%s count=%s watermark=%s ch_max_ts=%s",
+        kind,
+        mode,
+        count,
+        wm,
+        _format_stall_ts(max_ts),
+    )
+
+
+def _note_stuck_catchup(watermark: Optional[datetime]) -> None:
+    """Empty catch-up whose resume cursor did not move forward."""
+    global _consecutive_failures, _consecutive_stuck_catchup
+    _consecutive_failures = 0
+    _consecutive_stuck_catchup += 1
+    _emit_stall("empty-catch-up", _consecutive_stuck_catchup, "catch-up", watermark)
+
+
+def _note_cycle_failure(watermark: Optional[datetime]) -> None:
+    """One exception in the cycle loop. May SystemExit when the watchdog is on."""
+    global _consecutive_failures, _consecutive_stuck_catchup
+    _consecutive_stuck_catchup = 0
+    _consecutive_failures += 1
+    mode = "catch-up" if is_catching_up(watermark) else "live"
+    _emit_stall("failure", _consecutive_failures, mode, watermark)
+    if WATCHDOG_EXIT_FAILURES > 0 and _consecutive_failures >= WATCHDOG_EXIT_FAILURES:
+        logging.error(
+            "Watchdog exiting after %s consecutive cycle failures",
+            _consecutive_failures,
+        )
+        raise SystemExit(1)
+
+
 def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     """Process one window. Returns the watermark (resume cursor) to persist next.
 
@@ -821,6 +961,18 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
     now = _utcnow_naive()
     catching_up = is_catching_up(watermark, now)
     mode = "catch-up" if catching_up else "live"
+    if catching_up and watermark is not None:
+        window_start = watermark
+        window_end = watermark + timedelta(seconds=WINDOW_SECONDS)
+    else:
+        window_start = now - timedelta(minutes=LIVE_LOOKBACK_MINUTES)
+        window_end = now
+    logging.info(
+        "window mode=%s start=%s end=%s",
+        mode,
+        window_start.strftime(TS_FORMAT),
+        window_end.strftime(TS_FORMAT),
+    )
 
     rows, corroborated, _skipped_null, skipped_invalid, field_sentinel = fetch_positions(
         watermark, catching_up
@@ -840,8 +992,16 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
         write_health(0)
         # Empty catch-up window must still advance or the pipeline stalls forever.
         if catching_up and watermark is not None:
-            return watermark + timedelta(seconds=WINDOW_SECONDS)
+            advanced = watermark + timedelta(seconds=WINDOW_SECONDS)
+            # A forward step is the normal gap walk. Stall only when the cursor
+            # stays put, which is the residual case this counter exists for.
+            if advanced > watermark:
+                _reset_stall_counters()
+            else:
+                _note_stuck_catchup(watermark)
+            return advanced
         # Live + empty: keep the existing resume cursor if we have one.
+        _reset_stall_counters()
         return watermark
 
     existing = load_existing_positions([int(row[I_MMSI]) for row in rows])
@@ -876,6 +1036,7 @@ def run_cycle(watermark: Optional[datetime]) -> Optional[datetime]:
         len(rewind),
         newest.strftime(TS_FORMAT),
     )
+    _reset_stall_counters()
 
     # Catch-up must advance past ClickHouse gaps. An empty window already steps
     # by WINDOW_SECONDS; a window that only returns rows at/before the watermark
@@ -948,6 +1109,7 @@ def main() -> None:
 
         except Exception:
             logging.exception("Cycle failed")
+            _note_cycle_failure(watermark)
             time.sleep(ERROR_SLEEP_SEC)
             continue
 
